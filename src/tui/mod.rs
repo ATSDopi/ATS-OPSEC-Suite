@@ -105,10 +105,10 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
         term.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
+                Event::Key(k) if k.kind == KeyEventKind::Press => on_key_or_burst(app, k),
                 Event::Resize(w, h) => app.rain.resize(w, h),
                 // Drag & drop : le terminal colle le chemin du fichier
-                // (bracketed paste) → on le sélectionne comme cible.
+                // (bracketed paste — unix uniquement, voir drain_key_burst).
                 Event::Paste(text) => on_paste(app, &text),
                 Event::Mouse(m) => on_mouse(app, m),
                 _ => {}
@@ -119,6 +119,57 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
             return Ok(());
         }
     }
+}
+
+/// Windows : le bracketed-paste n'existe pas (API console legacy) — un
+/// drop/collage arrive en **rafale de KeyEvents** (chemin « tapé » char
+/// par char). Si des events sont encore en attente derrière la touche,
+/// on draine la rafale : texte ressemblant à un chemin → `on_paste`,
+/// sinon on rejoue les Press dans l'ordre (les Release consommés sont
+/// ceux qu'on ignorait de toute façon). Retourne `true` si la rafale
+/// a été traitée ici.
+fn on_key_or_burst(app: &mut App, k: KeyEvent) {
+    if !drain_key_burst(app, k) {
+        on_key(app, k);
+    }
+}
+
+fn drain_key_burst(app: &mut App, first: KeyEvent) -> bool {
+    if !matches!(event::poll(Duration::from_millis(0)), Ok(true)) {
+        return false;
+    }
+    let mut keys = vec![first];
+    let mut chars = String::new();
+    let deadline = Instant::now() + Duration::from_millis(80);
+    while Instant::now() < deadline && matches!(event::poll(Duration::from_millis(2)), Ok(true)) {
+        match event::read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                match k.code {
+                    KeyCode::Char(c) => chars.push(c),
+                    KeyCode::Enter => chars.push('\n'),
+                    _ => {}
+                }
+                keys.push(k);
+            }
+            Ok(Event::Paste(t)) => chars.push_str(&t),
+            _ => {}
+        }
+    }
+    if let KeyCode::Char(c) = first.code {
+        chars = format!("{c}{chars}");
+    }
+    let text = chars.trim_end_matches(['\r', '\n']).to_string();
+    // Chemin droppé : contient un séparateur ou un drive `:`.
+    // Paste texte : plusieurs chars ou une ligne collée.
+    let looks_pasted = text.contains(['\\', '/', ':']) || text.len() >= 4 || chars.contains('\n');
+    if looks_pasted {
+        on_paste(app, &text);
+    } else {
+        for k in keys {
+            on_key(app, k);
+        }
+    }
+    true
 }
 
 fn on_tick(app: &mut App) {
