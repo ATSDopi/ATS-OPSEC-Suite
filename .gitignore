@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Secrets & env — jamais commités
+.env
+.env.*
+*.key
+*.pem
+
+# Contexte interne IA — reste local (repo public)
+AGENTS.md
+CLAUDE.md
+
+# OS junk
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# IDE
+.idea/
+.vs/
+.vscode/
+*.swp
+
+# Outputs de test locaux
+*.aos
+/tmp/
