@@ -1,7 +1,15 @@
-//! Moteur cryptographique — staged v0.1 (types + format), implémentation v0.2.
+//! Moteur cryptographique — v0.2.
 //!
-//! Voir docs/SPEC.md §2.1 : format `.aos`, STREAM chunked, cascade AEAD,
-//! Argon2id paramétrable, hybride X25519+ML-KEM-768.
+//! Format `.aos` : `format.rs` · STREAM AEAD : `engine.rs` · KDF : `kdf.rs`
+//! · KEM hybride X-Wing : `kem.rs` · keyring : `keys.rs` · diceware :
+//! `passphrase.rs`. Voir docs/SPEC.md §2.1 pour le design complet.
+
+pub mod engine;
+pub mod format;
+pub mod kdf;
+pub mod kem;
+pub mod keys;
+pub mod passphrase;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +44,15 @@ impl CipherSuite {
             CipherSuite::Cascade => "xchacha20+aes256gcm",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "xchacha20" | "xchacha" | "chacha" => Some(Self::XChaCha20),
+            "aes256gcm" | "aes-gcm" | "aes" | "aes256" => Some(Self::Aes256Gcm),
+            "cascade" | "both" | "dual" => Some(Self::Cascade),
+            _ => None,
+        }
+    }
 }
 
 /// Paramètres Argon2id — entièrement exposés en mode Expert.
@@ -61,29 +78,24 @@ impl Default for Argon2Params {
 }
 
 impl Argon2Params {
-    /// Profil « paranoid » : 512 Mio / 4 / 4 (calibrer via `bench` en v0.2).
+    /// Profil « paranoid » : 512 Mio / 4 / 4 (calibrer via `bench`).
     pub const PARANOID: Self = Self {
         m_kib: 512 * 1024,
         t: 4,
         p: 4,
     };
+
+    /// Bornes acceptées par Argon2 (et par notre UI).
+    pub fn clamp(&mut self) {
+        self.m_kib = self.m_kib.clamp(8 * 1024, 2 * 1024 * 1024);
+        self.t = self.t.clamp(1, 10);
+        self.p = self.p.clamp(1, 8);
+    }
 }
 
-/// En-tête authentifié du container `.aos` — sérialisé JSON, préfixé par
-/// magic + longueur u32 LE. Tout champ nécessaire au déchiffrement y figure.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AosHeader {
-    pub v: u16,
-    pub suite: CipherSuite,
-    pub kdf: Argon2Params,
-    pub salt_hex: String,
-    pub chunk_size: u32,
-    pub nonce_prefix_hex: String,
-    pub compressed: bool,
-    pub padded: bool,
-}
-
-/// Module crypto — volontairement non implémenté en v0.1 (TUI d'abord).
-pub fn staged_notice() -> &'static str {
-    "crypto engine staged for v0.2 — see docs/SPEC.md"
-}
+pub use engine::{
+    Credential, EncryptOptions, KeySource, decrypt_file, decrypt_stream, encrypt_file,
+    encrypt_stream, inspect, inspect_bytes,
+};
+pub use format::AosHeader;
+pub use kem::{XwingPublic, XwingSecret};

@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::config::{Config, Mode};
 use crate::error::Result;
-use app::{App, Level, Modal, PendingAction, Screen, Tab};
+use app::{App, Field, Level, Modal, PendingAction, Screen, Tab};
 
 /// Lance le TUI. Sans TTY (pipe/CI) : message et retour propre.
 pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
@@ -107,6 +107,45 @@ fn on_tick(app: &mut App) {
             enter_main(app);
         }
     }
+    drain_worker(app);
+}
+
+/// Consomme les messages du worker : progression → modale, Done/Err → log.
+fn drain_worker(app: &mut App) {
+    let mut msgs = Vec::new();
+    let mut finished = false;
+    if let Some(w) = &app.worker {
+        while let Ok(m) = w.rx.try_recv() {
+            if matches!(m, app::WorkerMsg::Done(_) | app::WorkerMsg::Err(_)) {
+                finished = true;
+            }
+            msgs.push(m);
+        }
+    }
+    for m in msgs {
+        match m {
+            app::WorkerMsg::Progress(d) => {
+                if let Some(Modal::Progress { done, .. }) = &mut app.modal {
+                    *done = d;
+                }
+            }
+            app::WorkerMsg::Done(msg) => {
+                app.push_log(Level::Ok, msg.clone());
+                app.toast(msg);
+                app.modal = None;
+            }
+            app::WorkerMsg::Err(msg) => {
+                app.push_log(Level::Err, msg.clone());
+                app.modal = Some(Modal::Info {
+                    title: "OPERATION FAILED".into(),
+                    lines: vec![msg],
+                });
+            }
+        }
+    }
+    if finished {
+        app.worker = None;
+    }
 }
 
 fn enter_main(app: &mut App) {
@@ -136,13 +175,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
     if let Some(m) = app.modal.take() {
-        if let Modal::Confirm { action, .. } = m {
-            if k.code == KeyCode::Char('y') {
-                do_action(app, action);
-            } else {
-                app.push_log(Level::Info, "action aborted");
-            }
-        }
+        handle_modal_key(app, m, k, ctrl);
         return;
     }
     if app.screen == Screen::Boot {
@@ -193,16 +226,86 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
             KeyCode::Up => app.picker_vault.move_sel(-1),
             KeyCode::Down => app.picker_vault.move_sel(1),
             KeyCode::Enter => app.picker_vault.activate(),
-            KeyCode::Char('e') | KeyCode::Char('d') | KeyCode::Char('i') => {
-                if app.picker_vault.target.is_some() {
-                    let op = if k.code == KeyCode::Char('e') {
-                        "encrypt"
-                    } else if k.code == KeyCode::Char('d') {
-                        "decrypt"
+            KeyCode::Char('c') => {
+                use crate::crypto::CipherSuite as S;
+                app.vault_suite = match app.vault_suite {
+                    S::XChaCha20 => S::Aes256Gcm,
+                    S::Aes256Gcm => S::Cascade,
+                    S::Cascade => S::XChaCha20,
+                };
+                app.toast(format!("cipher: {}", app.vault_suite.label()));
+            }
+            KeyCode::Char('z') => app.vault_compress = !app.vault_compress,
+            KeyCode::Char('g') => app.vault_pad = !app.vault_pad,
+            KeyCode::Char('o') => {
+                app.vault_shred_orig = !app.vault_shred_orig;
+                if app.vault_shred_orig {
+                    app.toast("original will be shredded after encrypt");
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(t) = app.picker_vault.target.clone() {
+                    if t.path.extension().and_then(|e| e.to_str()) == Some("aos") {
+                        app.toast("already an .aos container");
                     } else {
-                        "header audit"
-                    };
-                    app.modal = Some(staged_modal(op));
+                        app.modal = Some(Modal::Input {
+                            title: format!("ENCRYPT — {}", t.name),
+                            fields: vec![
+                                Field::masked("passphrase").hint("[tab] next · empty = abort"),
+                                Field::masked("confirm"),
+                            ],
+                            sel: 0,
+                            strength_meter: true,
+                            action: PendingAction::Encrypt(t.path.clone()),
+                        });
+                    }
+                } else {
+                    app.toast("select a target file first");
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(t) = app.picker_vault.target.clone() {
+                    match crate::crypto::inspect(&t.path) {
+                        Ok(h) if h.is_password_mode() => {
+                            app.modal = Some(Modal::Input {
+                                title: format!("DECRYPT — {}", t.name),
+                                fields: vec![Field::masked("passphrase")],
+                                sel: 0,
+                                strength_meter: false,
+                                action: PendingAction::Decrypt(t.path.clone()),
+                            });
+                        }
+                        Ok(h) => {
+                            let fps: Vec<String> =
+                                h.recipients.iter().map(|r| r.fingerprint.clone()).collect();
+                            app.modal = Some(Modal::Input {
+                                title: format!("DECRYPT — {}", t.name),
+                                fields: vec![Field::plain("key name").hint(format!(
+                                    "slots: {} · empty = try whole keyring",
+                                    fps.join(", ")
+                                ))],
+                                sel: 0,
+                                strength_meter: false,
+                                action: PendingAction::DecryptKey(t.path.clone()),
+                            });
+                        }
+                        Err(_) => app.toast("not an .aos container"),
+                    }
+                } else {
+                    app.toast("select a target file first");
+                }
+            }
+            KeyCode::Char('i') => {
+                if let Some(t) = app.picker_vault.target.clone() {
+                    match crate::crypto::inspect(&t.path) {
+                        Ok(h) => app.modal = Some(header_modal(&h)),
+                        Err(e) => {
+                            app.modal = Some(Modal::Info {
+                                title: "NOT A CONTAINER".into(),
+                                lines: vec![e.to_string()],
+                            })
+                        }
+                    }
                 } else {
                     app.toast("select a target file first");
                 }
@@ -224,12 +327,62 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
                         lines: vec![
                             format!("irreversibly destroy: {name}"),
                             format!("passes: {}", app.shred_passes),
-                            "fs caveat: SSD/journal may retain blocks".into(),
+                            "fs caveat: SSD/journal/CoW may retain blocks".into(),
                         ],
                         action: PendingAction::Shred(t.path.clone()),
                     });
                 } else {
                     app.toast("select a target file first");
+                }
+            }
+            _ => {}
+        },
+        Tab::Keys => match k.code {
+            KeyCode::Up => app.keys_sel = app.keys_sel.saturating_sub(1),
+            KeyCode::Down if !app.keyring.is_empty() => {
+                app.keys_sel = (app.keys_sel + 1).min(app.keyring.len() - 1)
+            }
+            KeyCode::Char('g') => {
+                app.modal = Some(Modal::Input {
+                    title: "GENERATE X-WING KEYPAIR".into(),
+                    fields: vec![
+                        Field::plain("name").hint("x25519 + ml-kem-768 · stored in keyring"),
+                    ],
+                    sel: 0,
+                    strength_meter: false,
+                    action: PendingAction::Keygen,
+                });
+            }
+            KeyCode::Char('d') => {
+                if let Some((name, _, _)) = app.keyring.get(app.keys_sel).cloned() {
+                    app.modal = Some(Modal::Confirm {
+                        title: "DELETE KEYPAIR".into(),
+                        lines: vec![
+                            format!("delete '{name}' (.pub + .sec) ?"),
+                            "files encrypted to it become unrecoverable".into(),
+                        ],
+                        action: PendingAction::DeleteKey(name),
+                    });
+                }
+            }
+            KeyCode::Char('r') => {
+                app.keyring = crate::crypto::keys::list().unwrap_or_default();
+                app.keys_sel = app.keys_sel.min(app.keyring.len().saturating_sub(1));
+            }
+            KeyCode::Char('x') => {
+                if let Some((name, fp, _)) = app.keyring.get(app.keys_sel).cloned()
+                    && let Ok(p) = crate::crypto::keys::load_public(&name)
+                {
+                    app.modal = Some(Modal::Info {
+                        title: format!("PUBLIC KEY — {name}"),
+                        lines: vec![
+                            format!("fingerprint : {fp}"),
+                            format!("xwing bytes : {} B", p.to_bytes().len()),
+                            String::new(),
+                            format!("hex (share this):"),
+                            hex::encode(p.to_bytes()),
+                        ],
+                    });
                 }
             }
             _ => {}
@@ -312,27 +465,300 @@ fn settings_apply(app: &mut App) {
     }
 }
 
-fn do_action(app: &mut App, action: PendingAction) {
+/// Clavier quand une modale est ouverte — la modale a été `.take()`n,
+/// la remettre via `app.modal = Some(m)` pour la garder ouverte.
+fn handle_modal_key(app: &mut App, m: Modal, k: KeyEvent, ctrl: bool) {
+    match m {
+        Modal::Info { .. } => {}
+        Modal::Progress { title, done } => {
+            // Esc = cacher la fenêtre, le worker continue → résultat en log.
+            if k.code != KeyCode::Esc {
+                app.modal = Some(Modal::Progress { title, done });
+            }
+        }
+        Modal::Confirm { action, .. } => {
+            if k.code == KeyCode::Char('y') {
+                do_action(app, action, &[]);
+            } else {
+                app.push_log(Level::Info, "action aborted");
+            }
+        }
+        Modal::Input {
+            title,
+            mut fields,
+            mut sel,
+            strength_meter,
+            action,
+        } => match k.code {
+            KeyCode::Esc => app.push_log(Level::Info, "input cancelled"),
+            KeyCode::Tab | KeyCode::Down => {
+                sel = (sel + 1) % fields.len().max(1);
+                app.modal = Some(Modal::Input {
+                    title,
+                    fields,
+                    sel,
+                    strength_meter,
+                    action,
+                });
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                sel = (sel + fields.len().saturating_sub(1)) % fields.len().max(1);
+                app.modal = Some(Modal::Input {
+                    title,
+                    fields,
+                    sel,
+                    strength_meter,
+                    action,
+                });
+            }
+            KeyCode::Backspace => {
+                fields[sel].value.pop();
+                app.modal = Some(Modal::Input {
+                    title,
+                    fields,
+                    sel,
+                    strength_meter,
+                    action,
+                });
+            }
+            KeyCode::Enter => {
+                if sel + 1 < fields.len() {
+                    sel += 1;
+                    app.modal = Some(Modal::Input {
+                        title,
+                        fields,
+                        sel,
+                        strength_meter,
+                        action,
+                    });
+                } else {
+                    do_action(app, action, &fields);
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                fields[sel].value.push(c);
+                app.modal = Some(Modal::Input {
+                    title,
+                    fields,
+                    sel,
+                    strength_meter,
+                    action,
+                });
+            }
+            _ => {
+                app.modal = Some(Modal::Input {
+                    title,
+                    fields,
+                    sel,
+                    strength_meter,
+                    action,
+                });
+            }
+        },
+    }
+}
+
+/// Lance une tâche en arrière-plan + modale de progression.
+fn spawn_worker<F>(app: &mut App, label: String, f: F)
+where
+    F: FnOnce(std::sync::mpsc::Sender<app::WorkerMsg>) -> crate::error::Result<String>
+        + Send
+        + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = f(tx.clone());
+        let _ = tx.send(match res {
+            Ok(m) => app::WorkerMsg::Done(m),
+            Err(e) => app::WorkerMsg::Err(e.to_string()),
+        });
+    });
+    app.worker = Some(app::Worker { rx });
+    app.modal = Some(Modal::Progress {
+        title: label,
+        done: 0,
+    });
+}
+
+fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
+    use crate::crypto::engine::{self, Credential, EncryptOptions, KeySource};
+    let val = |i: usize| {
+        fields
+            .get(i)
+            .map(|f| f.value.trim().to_string())
+            .unwrap_or_default()
+    };
+
     match action {
         PendingAction::Shred(path) => {
-            app.push_log(
-                Level::Warn,
-                format!("shred requested → {} (engine staged v0.2)", path.display()),
-            );
-            app.modal = Some(staged_modal("shred"));
+            let passes = app.shred_passes as u32;
+            spawn_worker(app, format!("SHRED {}", path.display()), move |tx| {
+                crate::wipe::shred(&path, passes, &mut |d| {
+                    let _ = tx.send(app::WorkerMsg::Progress(d));
+                })
+                .map(|r| format!("shredded {} B ×{} passes", r.bytes, r.passes))
+            });
+        }
+        PendingAction::Encrypt(path) => {
+            let (p1, p2) = (val(0), val(1));
+            if p1.is_empty() {
+                app.toast("empty passphrase — aborted");
+                return;
+            }
+            if p1 != p2 {
+                app.toast("passphrases do not match");
+                app.push_log(Level::Err, "encrypt aborted: passphrase mismatch");
+                return;
+            }
+            let (score, _) = crate::crypto::passphrase::strength(&p1);
+            if score < 2 {
+                app.push_log(Level::Warn, "weak passphrase used (zxcvbn <2/4)");
+            }
+            let out = path.with_file_name(format!(
+                "{}.aos",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let opts = EncryptOptions {
+                suite: app.vault_suite,
+                argon2: app.argon2,
+                compress: app.vault_compress,
+                pad: app.vault_pad,
+                ..Default::default()
+            };
+            let shred_orig = app.vault_shred_orig;
+            let src = path.clone();
+            spawn_worker(app, format!("ENCRYPT {}", path.display()), move |tx| {
+                let key = KeySource::Password {
+                    pass: zeroize::Zeroizing::new(p1.into_bytes()),
+                    keyfile: None,
+                };
+                engine::encrypt_file(&src, &out, &key, &opts, &mut |d| {
+                    let _ = tx.send(app::WorkerMsg::Progress(d));
+                })?;
+                let mut msg = format!("encrypted → {}", out.display());
+                if shred_orig {
+                    crate::wipe::shred(&src, 3, &mut |_| {})?;
+                    msg.push_str(" · original shredded");
+                }
+                Ok(msg)
+            });
+        }
+        PendingAction::Decrypt(path) => {
+            let pass = val(0);
+            if pass.is_empty() {
+                app.toast("empty passphrase — aborted");
+                return;
+            }
+            let out = decrypt_out(&path);
+            spawn_worker(app, format!("DECRYPT {}", path.display()), move |tx| {
+                engine::decrypt_file(
+                    &path,
+                    &out,
+                    &Credential::Password {
+                        pass: zeroize::Zeroizing::new(pass.into_bytes()),
+                        keyfile: None,
+                    },
+                    &mut |d| {
+                        let _ = tx.send(app::WorkerMsg::Progress(d));
+                    },
+                )?;
+                Ok(format!("decrypted → {}", out.display()))
+            });
+        }
+        PendingAction::DecryptKey(path) => {
+            let name = val(0);
+            let out = decrypt_out(&path);
+            spawn_worker(app, format!("DECRYPT {}", path.display()), move |tx| {
+                let sec = if name.is_empty() {
+                    // essayer chaque clé secrète du keyring par fingerprint
+                    let mut hit = None;
+                    for (n, fp, has_sec) in crate::crypto::keys::list().unwrap_or_default() {
+                        if has_sec
+                            && engine::inspect(&path)
+                                .map(|h| h.recipients.iter().any(|r| r.fingerprint == fp))
+                                .unwrap_or(false)
+                        {
+                            hit = crate::crypto::keys::load_secret(&n).ok();
+                            if hit.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    hit.ok_or(crate::error::OpsecError::InvalidParam(
+                        "aucune clé du keyring ne correspond".into(),
+                    ))?
+                } else {
+                    crate::crypto::keys::load_secret(&name)?
+                };
+                engine::decrypt_file(&path, &out, &Credential::SecretKey(sec), &mut |d| {
+                    let _ = tx.send(app::WorkerMsg::Progress(d));
+                })?;
+                Ok(format!("decrypted → {}", out.display()))
+            });
+        }
+        PendingAction::Keygen => {
+            let name = val(0);
+            match crate::crypto::keys::keygen(&name) {
+                Ok((_pubp, _secp, fp)) => {
+                    app.push_log(Level::Ok, format!("xwing keypair '{name}' fp={fp}"));
+                    app.toast(format!("key '{name}' generated — {fp}"));
+                }
+                Err(e) => {
+                    app.toast("keygen failed");
+                    app.push_log(Level::Err, format!("keygen: {e}"));
+                }
+            }
+            app.keyring = crate::crypto::keys::list().unwrap_or_default();
+        }
+        PendingAction::DeleteKey(name) => {
+            match crate::crypto::keys::delete(&name) {
+                Ok(()) => app.push_log(Level::Warn, format!("keypair '{name}' deleted")),
+                Err(e) => app.push_log(Level::Err, format!("delete key: {e}")),
+            }
+            app.keyring = crate::crypto::keys::list().unwrap_or_default();
+            app.keys_sel = app.keys_sel.min(app.keyring.len().saturating_sub(1));
         }
     }
 }
 
-fn staged_modal(op: &str) -> Modal {
+fn decrypt_out(path: &std::path::Path) -> std::path::PathBuf {
+    if path.extension().and_then(|e| e.to_str()) == Some("aos") {
+        path.with_extension("")
+    } else {
+        path.with_extension("dec")
+    }
+}
+
+fn header_modal(h: &crate::crypto::AosHeader) -> Modal {
+    let mut lines = vec![
+        format!("format        : .aos v{}", h.v),
+        format!("suite         : {}", h.suite.label()),
+        format!("chunk size    : {} KiB", h.chunk_size / 1024),
+        format!(
+            "nonce prefix  : {}…",
+            &h.nonce_prefix_hex[..24.min(h.nonce_prefix_hex.len())]
+        ),
+        format!("compressed    : {}", h.compressed),
+        format!("padded        : {}", h.padded),
+    ];
+    match &h.kdf {
+        Some(k) => lines.push(format!(
+            "auth          : password · argon2id m={}KiB t={} p={}",
+            k.m_kib, k.t, k.p
+        )),
+        None => {
+            lines.push(format!(
+                "auth          : {} recipient slot(s)",
+                h.recipients.len()
+            ));
+            for s in &h.recipients {
+                lines.push(format!("  slot xwing  → {}", s.fingerprint));
+            }
+        }
+    }
     Modal::Info {
-        title: "MODULE STAGED".into(),
-        lines: vec![
-            format!("`{op}` is wired but the engine lands in v0.2."),
-            String::new(),
-            "pipeline ready: kdf(argon2id) → stream aead → verify-then-write".into(),
-            "see docs/SPEC.md §7 roadmap".into(),
-        ],
+        title: "CONTAINER HEADER".into(),
+        lines,
     }
 }
 

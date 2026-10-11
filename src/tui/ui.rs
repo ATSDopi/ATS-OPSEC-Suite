@@ -58,7 +58,7 @@ fn draw_main(f: &mut Frame, app: &mut App, theme: &Theme) {
         draw_help(f, area, theme);
     }
     if let Some(m) = &app.modal {
-        draw_modal(f, area, m, theme);
+        draw_modal(f, area, m, theme, app.tick);
     }
 
     // Overlay glitch de transition.
@@ -185,50 +185,212 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
-fn draw_modal(f: &mut Frame, area: Rect, m: &Modal, theme: &Theme) {
-    let (title, lines, confirm) = match m {
-        Modal::Info { title, lines } => (title.clone(), lines.clone(), false),
-        Modal::Confirm { title, lines, .. } => (title.clone(), lines.clone(), true),
-    };
-    let h = (lines.len() as u16 + 5).min(24);
-    let r = centered(area, 68, h);
-    Clear.render(r, f.buffer_mut());
+fn draw_modal(f: &mut Frame, area: Rect, m: &Modal, theme: &Theme, tick: u64) {
+    match m {
+        Modal::Input {
+            title,
+            fields,
+            sel,
+            strength_meter,
+            ..
+        } => draw_input_modal(f, area, title, fields, *sel, *strength_meter, theme, tick),
+        Modal::Progress { title, done } => draw_progress_modal(f, area, title, *done, theme, tick),
+        Modal::Info { title, lines } | Modal::Confirm { title, lines, .. } => draw_text_modal(
+            f,
+            area,
+            title,
+            lines,
+            matches!(m, Modal::Confirm { .. }),
+            theme,
+        ),
+    }
+}
 
-    let border_color = if confirm { theme.warn } else { theme.accent };
-    let block = Block::default()
+fn modal_block<'a>(title: &'a str, color: Color, theme: &Theme) -> Block<'a> {
+    let _ = theme;
+    Block::default()
         .title(format!(" {} ", title))
-        .title_style(
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        )
+        .title_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(border_color));
-    block.render(r, f.buffer_mut());
+        .border_style(Style::default().fg(color))
+}
 
-    let inner = Rect::new(
-        r.x + 2,
-        r.y + 2,
-        r.width.saturating_sub(4),
-        r.height.saturating_sub(3),
-    );
-    let text: Vec<Line> = lines.iter().map(|l| Line::from(l.clone())).collect();
+fn draw_text_modal(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    confirm: bool,
+    theme: &Theme,
+) {
+    // lignes longues → wrap simple
+    let mut text: Vec<Line> = Vec::new();
+    let w = 62usize;
+    for l in lines {
+        let mut s = l.as_str();
+        while s.chars().count() > w {
+            let cut = s.char_indices().nth(w).map(|(i, _)| i).unwrap_or(s.len());
+            text.push(Line::from(s[..cut].to_string()));
+            s = &s[cut..];
+        }
+        text.push(Line::from(s.to_string()));
+    }
+    let h = (text.len() as u16 + 4).min(28);
+    let r = centered(area, 70, h);
+    Clear.render(r, f.buffer_mut());
+    modal_block(
+        title,
+        if confirm { theme.warn } else { theme.accent },
+        theme,
+    )
+    .render(r, f.buffer_mut());
+    let inner = Rect::new(r.x + 2, r.y + 1, r.width - 4, r.height - 2);
     Paragraph::new(text)
         .style(Style::default().fg(theme.fg))
         .render(inner, f.buffer_mut());
-
     let hint = if confirm {
-        "[y] confirm    [n/esc] abort"
+        "[y] confirm   [n/esc] abort"
     } else {
         "[enter/esc] close"
     };
     let hw = hint.len() as u16;
     f.buffer_mut().set_string(
-        r.x + r.width.saturating_sub(hw + 2),
-        r.y + r.height.saturating_sub(1),
+        r.x + r.width.saturating_sub(hw + 1),
+        r.y + r.height - 1,
         hint,
         Style::default().fg(theme.dim),
+    );
+}
+
+/// Modale de saisie multi-champs — champs masqués, curseur, meter zxcvbn.
+#[allow(clippy::too_many_arguments)]
+fn draw_input_modal(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    fields: &[super::app::Field],
+    sel: usize,
+    strength_meter: bool,
+    theme: &Theme,
+    tick: u64,
+) {
+    let h = (fields.len() as u16 * 2 + if strength_meter { 6 } else { 5 }).min(20);
+    let r = centered(area, 64, h);
+    Clear.render(r, f.buffer_mut());
+    modal_block(title, theme.accent, theme).render(r, f.buffer_mut());
+    let mut y = r.y + 1;
+    let label_w = 12u16;
+    for (i, fld) in fields.iter().enumerate() {
+        let active = i == sel;
+        f.buffer_mut().set_string(
+            r.x + 2,
+            y,
+            fld.label,
+            Style::default().fg(if active { theme.accent } else { theme.dim }),
+        );
+        let shown: String = if fld.masked {
+            "•".repeat(fld.value.chars().count())
+        } else {
+            fld.value.clone()
+        };
+        let cursor = if active && (tick / 15).is_multiple_of(2) {
+            "▌"
+        } else {
+            " "
+        };
+        let field_w = (r.width - label_w - 6) as usize;
+        let mut disp: String = shown.chars().take(field_w - 1).collect();
+        if shown.chars().count() > field_w - 1 {
+            disp = shown
+                .chars()
+                .skip(shown.chars().count() - (field_w - 1))
+                .collect();
+        }
+        let style = if active {
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        f.buffer_mut()
+            .set_string(r.x + 2 + label_w, y, format!("{disp}{cursor}"), style);
+        if let Some(hint) = &fld.hint {
+            f.buffer_mut().set_string(
+                r.x + 2 + label_w,
+                y + 1,
+                hint,
+                Style::default().fg(theme.dim),
+            );
+        }
+        y += 2;
+    }
+    if strength_meter {
+        let pw = fields.first().map(|f| f.value.as_str()).unwrap_or("");
+        let (score, bits) = if pw.is_empty() {
+            (0u8, 0.0)
+        } else {
+            crate::crypto::passphrase::strength(pw)
+        };
+        let segs = 10usize;
+        let filled = (score as usize * segs) / 4;
+        let bar: String = "█".repeat(filled) + &"░".repeat(segs - filled);
+        let (label, c) = match score {
+            0 | 1 => ("weak", theme.err),
+            2 => ("fair", theme.warn),
+            3 => ("strong", theme.ok),
+            _ => ("excellent", theme.accent2),
+        };
+        let line = Line::from(vec![
+            Span::styled("strength    ", Style::default().fg(theme.dim)),
+            Span::styled(bar, Style::default().fg(c)),
+            Span::styled(format!(" {label} ~{bits:.0}b"), Style::default().fg(c)),
+        ]);
+        Paragraph::new(line).render(Rect::new(r.x + 2, y, r.width - 4, 1), f.buffer_mut());
+    }
+    let hint = "[enter] next/confirm   [tab] field   [esc] cancel";
+    f.buffer_mut().set_string(
+        r.x + 2,
+        r.y + r.height - 1,
+        hint,
+        Style::default().fg(theme.dim),
+    );
+}
+
+/// Progression d'un worker — spinner + octets traités.
+fn draw_progress_modal(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    done: u64,
+    theme: &Theme,
+    tick: u64,
+) {
+    let r = centered(area, 52, 7);
+    Clear.render(r, f.buffer_mut());
+    modal_block(title, theme.accent2, theme).render(r, f.buffer_mut());
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spin = frames[(tick / 2) as usize % frames.len()];
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {spin} "), Style::default().fg(theme.accent)),
+            Span::styled("processing…", Style::default().fg(theme.fg)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  {:.1} MiB · argon2id may take ~1s on small files",
+                done as f64 / 1048576.0
+            ),
+            Style::default().fg(theme.dim),
+        )),
+        Line::from(Span::styled(
+            "  [esc] hide window",
+            Style::default().fg(theme.dim),
+        )),
+    ];
+    Paragraph::new(lines).render(
+        Rect::new(r.x + 2, r.y + 1, r.width - 4, r.height - 2),
+        f.buffer_mut(),
     );
 }
 
@@ -241,15 +403,20 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ("  t", "cycle theme"),
         ("  p", "panic screen"),
         ("  q / ctrl+c", "quit"),
-        ("vault / shred", ""),
-        ("  ↑ ↓", "navigate files"),
-        ("  enter", "open dir / select file"),
-        ("  e d i", "encrypt · decrypt · info (staged v0.2)"),
-        ("  s", "shred (staged v0.2)"),
+        ("vault", ""),
+        ("  ↑ ↓ / enter", "navigate / select file"),
+        ("  e d i", "encrypt · decrypt · audit header"),
+        ("  c z g o", "cipher · compress · pad · shred-orig"),
+        ("shred", ""),
+        ("  s / [ ]", "shred target / passes"),
+        ("keys", ""),
+        ("  g x d r", "gen · export pub · delete · refresh"),
         ("xfer", ""),
         ("  type", "edit QR payload"),
         ("settings", ""),
         ("  ↑ ↓ ← → enter", "navigate / adjust / apply"),
+        ("modals", ""),
+        ("  tab enter esc", "field · confirm · cancel"),
     ];
     let h = (lines.len() as u16 + 4).min(area.height - 2);
     let r = centered(area, 52, h);

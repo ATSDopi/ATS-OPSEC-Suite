@@ -1,5 +1,11 @@
 # ATS-OPSEC-Suite — Cahier des charges (v2, enrichi)
 
+> **État v0.2 (implémenté)** : TUI complet + moteur `.aos` v1 (Argon2id →
+> HKDF → STREAM XChaCha20/AES-256-GCM/cascade, en-tête authentifié par AAD),
+> KEM hybride X-Wing (X25519+ML-KEM-768) multi-destinataires, keyring,
+> keyfiles, diceware+zxcvbn, shred multi-passes, CLI complet — **non
+> audité**. Voir §7 pour le détail du shipped.
+
 > Document de conception complet. Fusion de la spec initiale
 > (`spécifications_de_la_suite_opsec_ultime.md`) et d'un brainstorming
 > fonctionnel/technique poussé. Chaque feature est taggée par version cible.
@@ -287,16 +293,19 @@ déjà découpés pour ça. **Zéro logique métier dans tui/cli.**
 
 ## 7. Roadmap
 
-- **v0.1 (MVP)** — boot anim, TUI onglets/dashboard/probe, `.aos`
-  password-based XChaCha20/AES-GCM + cascade, STREAM chunked, Argon2
-  bench, shred de base, CLI encrypt/decrypt/info/shred/probe/bench, QR
-  statique, tests + CI.
-- **v0.2** — trousseau + keyfiles, hybride X25519+ML-KEM-768, recipients,
-  stégo PNG/WAV dispersé + capacité, compression/padding, QR fountain
-  TX, palette de commandes, thèmes, tachyonfx, anti-VM warnings.
-- **v0.3** — volumes cachés + duress, Shamir, ML-DSA signatures,
-  auto-stéganalyse, QR RX webcam, panic+leurre, wipe free space,
-  backup papier, canaris.
+- **v0.1 ✅ shipped** — boot anim, TUI onglets/dashboard/probe réel,
+  QR statique, tests + CI.
+- **v0.2 ✅ shipped** — `.aos` v1 : Argon2id paramétrable (+bench) → HKDF →
+  STREAM chunked XChaCha20 / AES-256-GCM / cascade, AAD sur en-tête
+  signée, keyfiles BLAKE3, compression zstd, padding 4 Kio + jitter,
+  X-Wing (X25519+ML-KEM-768) multi-destinataires, keyring `.pub/.sec`,
+  diceware + zxcvbn, shred N passes + rename + unlink, CLI complet,
+  TUI : modales de saisie masquée + workers de progression + onglets
+  VAULT/KEYS/SHRED câblés sur le moteur.
+- **v0.3** — stégo PNG/WAV dispersé + capacité + auto-analyse, QR fountain
+  TX/RX (raptorq + webcam), sealed keyring (mot de passe maître),
+  Shamir k-of-n + backup papier, volumes cachés + duress, ML-DSA
+  signatures, wipe free space, tachyonfx, palette de commandes.
 - **stretch** — DCT JPEG, SLH-DSA, timelock, audio FSK, rapport
   forensique inversé, plugins wasm.
 

@@ -3,10 +3,11 @@
 **File-centric OPSEC toolkit** — encrypt, hide, transfer and destroy specific
 files with surgical granularity, from a cinematic terminal UI.
 
-> ⚠️ **Early stage (v0.1).** The TUI shell, system probe and CLI skeleton are
-> functional. The crypto engine is staged for v0.2 — see
-> [`docs/SPEC.md`](docs/SPEC.md) for the full design document and roadmap.
-> Do **not** rely on it for real secrets yet.
+> ⚠️ **v0.2 — crypto engine live but unaudited.** The `.aos` container format,
+> streaming AEAD, Argon2id KDF, hybrid post-quantum KEM (X-Wing:
+> X25519+ML-KEM-768), keyring and shredding are implemented and tested
+> (26 tests). This is **not** a security-audited codebase — design rationale in
+> [`docs/SPEC.md`](docs/SPEC.md). Use for real secrets at your own risk.
 
 ```
  ╔══════════════════════════════════════════════════════════════════════╗
@@ -46,7 +47,22 @@ cargo install --path .
 ats-opsec            # launch the TUI (boot animation + dashboard)
 ats-opsec --no-anim  # skip the boot sequence
 ats-opsec probe      # host capability report (real syscalls)
-ats-opsec probe --json
+
+# encryption
+ats-opsec encrypt secrets.zip                    # → secrets.zip.aos (argon2id)
+ats-opsec encrypt big.iso --cipher cascade       # xchacha20 + aes-256-gcm
+ats-opsec encrypt notes.txt --compress --pad     # zstd + size padding
+ats-opsec decrypt secrets.zip.aos                # → secrets.zip
+ats-opsec info secrets.zip.aos                   # audit container header
+
+# hybrid post-quantum recipients (X-Wing: x25519 + ml-kem-768)
+ats-opsec keys gen alice                         # → %APPDATA%/ats-opsec/keys/
+ats-opsec encrypt report.pdf --to @alice         # no password needed
+ats-opsec decrypt report.pdf.aos --key alice
+
+ats-opsec keys passphrase -n 7                   # diceware (~90 bits)
+ats-opsec shred secrets.zip -p 3                 # best-effort secure erase
+ats-opsec bench                                  # argon2 calib + aead speed
 ```
 
 ## TUI
@@ -55,27 +71,63 @@ ats-opsec probe --json
   checklist fed by a *real* system probe (CSPRNG, CPUID features,
   hypervisor bit, memory locking, filesystem type, tracer detection).
 - **8 keyboard-driven modules** — `←→`/`tab`/`1-8` to navigate:
-  DASH (profile + OPSEC score) · VAULT (file picker, encrypt staged) ·
-  STEGO · SHRED (passes + honest SSD warnings) · XFER (live QR render) ·
-  KEYS · CFG (standard/expert mode, Argon2 params, themes) · LOGS.
+  DASH (profile + OPSEC score) · VAULT (picker + real encrypt/decrypt/audit
+  with live cipher/compress/pad toggles) · STEGO · SHRED (real multi-pass
+  overwrite, worker progress) · XFER (live QR render) · KEYS (X-Wing
+  keyring: gen/export/delete) · CFG (standard/expert, Argon2 params,
+  themes) · LOGS.
+- **Input modals** — masked passphrase entry with live zxcvbn strength
+  meter; long ops run in background workers with progress.
 - **`p` panic screen** — instant decoy (innocent PowerShell session).
 - **`?` help overlay**, `t` theme cycle (cyber/amber/ice/crimson),
   `q`/`ctrl+c` quit.
 
+## `.aos` container (v1)
+
+```
+"AOS1" | header_len u32 | header JSON | chunk stream | random padding?
+chunk := u32 LE (bit31 = LAST) | ciphertext (plaintext + 16B AEAD tag)
+```
+
+- **KDF**: Argon2id (64 MiB / t3 / p4 default; up to 2 GiB in expert mode)
+  + HKDF-SHA256 subkeys — header salt + params stored, authenticated.
+- **AEAD**: XChaCha20-Poly1305 (default), AES-256-GCM (AES-NI) or
+  **cascade** (XChaCha inside AES-GCM). Per-chunk counter nonces +
+  random 16B nonce prefix; header bound via AAD (tamper-proof metadata).
+- **STREAM**: chunked (256 KiB default) — wrong password fails on the
+  first chunk, truncation is detected, multi-GB files don't touch RAM.
+- **Recipients**: X-Wing hybrid KEM (X25519 + ML-KEM-768 per
+  draft-irtf-cfrg-xwing) — secure even if one half breaks; multi-recipient
+  slots wrap a random 32B file key.
+- **Options**: keyfiles (BLAKE3 mixed), Zstandard pre-encryption,
+  4 KiB-quantized + jittered size padding, shred-original.
+- **Measured** (Ryzen-class, release): ~1.1 GiB/s per AEAD layer,
+  ~0.63 GiB/s cascade. Argon2id 64 MiB ≈ 1.6 s.
+
 ## CLI
 
 ```
-ats-opsec probe [--json]     capability report
-ats-opsec config show|path   active configuration
-ats-opsec encrypt|decrypt|info|shred|stego|qr|bench|keys   [staged v0.2]
+ats-opsec encrypt <file> [--cipher xchacha20|aes256gcm|cascade]
+                         [--to @name | --to-pub hex] [--keyfile f]
+                         [--compress] [--pad] [--shred] [-m/-t/-p argon2]
+ats-opsec decrypt <file.aos> [--key name] [--keyfile f] [-o out]
+ats-opsec info <file.aos> [--json]    container audit
+ats-opsec shred <file> [-p N]         N-pass overwrite + rename + unlink
+ats-opsec keys gen|list|pub|export|import|delete|passphrase
+ats-opsec bench [--argon-only|--aead-only] [--mib N]
+ats-opsec stego|qr                     staged (v0.3)
+ats-opsec probe [--json] · config show|path
 ```
 
 ## Stack
 
 Rust 2024 · `ratatui`+`crossterm` (TUI) · `clap` · `serde`/`toml` ·
-`windows-sys`/`libc` (OS probes) · `qrcode` · `blake3`.
-Roadmap crates (SPEC §4): `chacha20poly1305`, `aes-gcm`, `serpent`,
-`argon2`, `ml-kem`, `ml-dsa`, `raptorq`, `image`, `hound`.
+`windows-sys`/`libc` (OS probes) · `qrcode` · `blake3` · `argon2` ·
+`hkdf`/`sha2`/`sha3` · `chacha20poly1305` + `aes-gcm` · `ml-kem` (FIPS 203)
++ `x25519-dalek` · `zstd` · `zeroize` + `subtle` · `zxcvbn` · `getrandom`.
+
+Roadmap crates (SPEC §4): `ml-dsa`, `serpent`, `raptorq`, `image`, `hound`,
+`sssa`, `entropy`.
 
 ## Commands
 

@@ -196,16 +196,16 @@ fn dashboard(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     // Col 3 — modules.
     let modules = [
-        ("crypto engine", "staged", "v0.2", theme.warn),
-        ("cascade cipher", "staged", "v0.2", theme.warn),
-        ("pq hybrid kem", "planned", "v0.2", theme.dim),
-        ("stego carrier", "planned", "v0.2", theme.dim),
-        ("secure wipe", "staged", "v0.2", theme.warn),
-        ("qr fountain", "static qr", "v0.1", theme.ok),
-        ("keyring", "planned", "v0.2", theme.dim),
+        ("crypto engine .aos", "live", "v0.2", theme.ok),
+        ("cascade cipher", "live", "v0.2", theme.ok),
+        ("pq hybrid kem (xwing)", "live", "v0.2", theme.ok),
+        ("keyring", "live", "v0.2", theme.ok),
+        ("secure wipe", "live", "v0.2", theme.ok),
+        ("zstd + pad-size", "live", "v0.2", theme.ok),
+        ("stego carrier", "planned", "v0.3", theme.dim),
+        ("qr fountain", "static qr", "v0.3", theme.warn),
         ("hidden volumes", "planned", "v0.3", theme.dim),
         ("duress/decoy", "planned", "v0.3", theme.dim),
-        ("honeyfiles", "planned", "v0.3", theme.dim),
     ];
     let rows_t: Vec<Row> = modules
         .iter()
@@ -310,34 +310,54 @@ fn vault(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .block(panel("TARGET", theme))
         .render(right[0], f.buffer_mut());
 
-    // Actions.
+    // Actions + options live.
+    let on = |b: bool| {
+        if b {
+            ("on ", theme.ok)
+        } else {
+            ("off", theme.dim)
+        }
+    };
+    let (zc, zo) = (on(app.vault_compress), on(app.vault_shred_orig));
+    let (gc, _go) = (on(app.vault_pad), on(false));
     let actions = vec![
         Line::from(vec![
             Span::styled("[e] ", Style::default().fg(theme.accent)),
-            Span::raw("encrypt → .aos container   "),
-            Span::styled("staged v0.2", Style::default().fg(theme.warn)),
-        ]),
-        Line::from(vec![
+            Span::raw("encrypt → .aos    "),
             Span::styled("[d] ", Style::default().fg(theme.accent)),
-            Span::raw("decrypt .aos → plaintext  "),
-            Span::styled("staged v0.2", Style::default().fg(theme.warn)),
-        ]),
-        Line::from(vec![
+            Span::raw("decrypt    "),
             Span::styled("[i] ", Style::default().fg(theme.accent)),
-            Span::raw("container header audit   "),
-            Span::styled("staged v0.2", Style::default().fg(theme.warn)),
+            Span::raw("header audit"),
         ]),
         Line::from(""),
         Line::from(vec![
+            Span::styled("[c] ", Style::default().fg(theme.accent)),
+            Span::raw("cipher  "),
             Span::styled(
-                "pipeline: argon2id → stream aead → ",
-                Style::default().fg(theme.dim),
-            ),
-            Span::styled(
-                "xchacha20 | aes-256-gcm | cascade",
+                format!("{:<22}", app.vault_suite.label()),
                 Style::default().fg(theme.accent2),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("[z] ", Style::default().fg(theme.accent)),
+            Span::raw("compress  "),
+            Span::styled(zc.0, Style::default().fg(zc.1)),
+            Span::raw("   [g] pad-size  "),
+            Span::styled(gc.0, Style::default().fg(gc.1)),
+        ]),
+        Line::from(vec![
+            Span::styled("[o] ", Style::default().fg(theme.accent)),
+            Span::raw("shred original after encrypt  "),
+            Span::styled(zo.0, Style::default().fg(zo.1)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "kdf: argon2id m={}KiB t={} p={}",
+                app.argon2.m_kib, app.argon2.t, app.argon2.p
+            ),
+            Style::default().fg(theme.dim),
+        )),
     ];
     Paragraph::new(actions)
         .block(panel("OPERATIONS", theme))
@@ -607,48 +627,88 @@ fn transfer(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 // ---------------------------------------------------------------- keys
 
-fn keys(f: &mut Frame, area: Rect, _app: &App, theme: &Theme) {
+fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    let empty = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  keyring empty",
-            Style::default().fg(theme.dim),
-        )),
-        Line::from(Span::styled(
-            "  sealed by master passphrase (argon2id → aead) — v0.2",
-            Style::default().fg(theme.dim),
-        )),
-    ];
-    Paragraph::new(empty)
-        .block(panel("KEYRING", theme))
+    if app.keyring.is_empty() {
+        let empty = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  keyring empty — [g] generate an X-Wing keypair",
+                Style::default().fg(theme.dim),
+            )),
+            Line::from(Span::styled(
+                "  hybrid x25519 + ml-kem-768 (post-quantum safe)",
+                Style::default().fg(theme.dim),
+            )),
+        ];
+        Paragraph::new(empty)
+            .block(panel("KEYRING", theme))
+            .render(cols[0], f.buffer_mut());
+    } else {
+        let rows: Vec<Row> = app
+            .keyring
+            .iter()
+            .enumerate()
+            .map(|(i, (n, fp, has_sec))| {
+                let sel = i == app.keys_sel;
+                Row::new(vec![
+                    Cell::from(if sel { "▶" } else { " " }),
+                    Cell::from(n.clone()),
+                    Cell::from(Span::styled(fp.clone(), Style::default().fg(theme.accent2))),
+                    Cell::from(Span::styled(
+                        if *has_sec { "pub+sec" } else { "pub only" },
+                        Style::default().fg(if *has_sec { theme.ok } else { theme.dim }),
+                    )),
+                ])
+            })
+            .collect();
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Percentage(38),
+                Constraint::Percentage(36),
+                Constraint::Percentage(26),
+            ],
+        )
+        .block(panel("KEYRING — xwing (x25519+ml-kem-768)", theme))
         .render(cols[0], f.buffer_mut());
+    }
 
-    let feats = [
-        ("keygen: x25519 · ed25519", "v0.2"),
-        ("keygen: ml-kem-768 · ml-dsa-65 (pq)", "v0.2"),
-        ("hybrid x-wing recipients", "v0.2"),
-        ("keyfiles (blake3 facteur)", "v0.2"),
-        ("ssh-style randomart fingerprint", "v0.2"),
-        ("shamir k-of-n + paper backup", "v0.3"),
-        ("duress key → decoy vault", "v0.3"),
+    let ops = [
+        ("[g]", "generate xwing keypair"),
+        ("[x]", "export public key (hex)"),
+        ("[d]", "delete selected pair"),
+        ("[r]", "refresh keyring"),
     ];
-    let items: Vec<ListItem> = feats
+    let mut items: Vec<ListItem> = ops
         .iter()
-        .map(|(n, v)| {
+        .map(|(k, n)| {
             ListItem::new(Line::from(vec![
-                Span::styled("· ", Style::default().fg(theme.dim)),
+                Span::styled(format!("{k} "), Style::default().fg(theme.accent)),
                 Span::styled(*n, Style::default().fg(theme.fg)),
-                Span::styled(format!("  [{v}]"), Style::default().fg(theme.dim)),
             ]))
         })
         .collect();
+    items.push(ListItem::new(""));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "⚠ .sec files are currently UNENCRYPTED on disk",
+        Style::default().fg(theme.warn),
+    ))));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  keyring sealed by master passphrase — v0.3",
+        Style::default().fg(theme.dim),
+    ))));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  encrypt to a recipient: cli `encrypt f --to @name`",
+        Style::default().fg(theme.dim),
+    ))));
     List::new(items)
-        .block(panel("PLANNED", theme))
+        .block(panel("OPERATIONS", theme))
         .render(cols[1], f.buffer_mut());
 }
 

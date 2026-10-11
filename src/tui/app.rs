@@ -62,7 +62,7 @@ impl Tab {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,
@@ -190,11 +190,74 @@ pub enum Modal {
         lines: Vec<String>,
         action: PendingAction,
     },
+    /// Saisie multi-champs (Enter = champ suivant / valider, Tab navigue).
+    Input {
+        title: String,
+        fields: Vec<Field>,
+        sel: usize,
+        /// Affiche le meter zxcvbn sous le premier champ.
+        strength_meter: bool,
+        action: PendingAction,
+    },
+    /// Travail en cours (alimenté par app.worker).
+    Progress { title: String, done: u64 },
+}
+
+#[derive(Debug)]
+pub struct Field {
+    pub label: &'static str,
+    pub value: String,
+    pub masked: bool,
+    pub hint: Option<String>,
+}
+
+impl Field {
+    pub fn masked(label: &'static str) -> Self {
+        Self {
+            label,
+            value: String::new(),
+            masked: true,
+            hint: None,
+        }
+    }
+    pub fn plain(label: &'static str) -> Self {
+        Self {
+            label,
+            value: String::new(),
+            masked: false,
+            hint: None,
+        }
+    }
+    pub fn hint(mut self, h: impl Into<String>) -> Self {
+        self.hint = Some(h.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum PendingAction {
     Shred(PathBuf),
+    /// fields: [password, confirm]
+    Encrypt(PathBuf),
+    /// fields: [password]
+    Decrypt(PathBuf),
+    /// fields: [key name or .sec path]
+    DecryptKey(PathBuf),
+    /// fields: [name]
+    Keygen,
+    DeleteKey(String),
+}
+
+/// Message d'un thread worker vers la UI.
+#[derive(Debug)]
+pub enum WorkerMsg {
+    Progress(u64),
+    Done(String),
+    Err(String),
+}
+
+pub struct Worker {
+    pub rx: std::sync::mpsc::Receiver<WorkerMsg>,
 }
 
 pub struct App {
@@ -224,6 +287,16 @@ pub struct App {
     /// Fenêtre de transition glitch après boot/panic.
     pub transition_end: Option<Instant>,
     pub status_msg: Option<(String, Instant)>,
+    /// Worker crypto/shred en arrière-plan (progression → modale).
+    pub worker: Option<Worker>,
+    /// Options du vault (toggles).
+    pub vault_suite: crate::crypto::CipherSuite,
+    pub vault_compress: bool,
+    pub vault_pad: bool,
+    pub vault_shred_orig: bool,
+    /// Keyring (nom, fingerprint, a_secret).
+    pub keyring: Vec<(String, String, bool)>,
+    pub keys_sel: usize,
 }
 
 impl App {
@@ -256,6 +329,13 @@ impl App {
             log_scroll: 0,
             transition_end: None,
             status_msg: None,
+            worker: None,
+            vault_suite: crate::crypto::CipherSuite::XChaCha20,
+            vault_compress: false,
+            vault_pad: false,
+            vault_shred_orig: false,
+            keyring: crate::crypto::keys::list().unwrap_or_default(),
+            keys_sel: 0,
         }
     }
 
