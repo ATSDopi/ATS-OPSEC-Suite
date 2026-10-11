@@ -296,20 +296,36 @@ fn on_paste(app: &mut App, text: &str) {
         }
         Tab::Keys => {
             if p.extension().and_then(|e| e.to_str()) == Some("aos") {
-                let default_key = app
-                    .keyring
-                    .get(app.keys_sel)
-                    .map(|(n, _, _)| n.clone())
-                    .unwrap_or_default();
-                app.modal = Some(Modal::Input {
-                    title: format!("DECRYPT WITH KEY — {}", cleaned),
-                    fields: vec![Field::plain("key name").hint(format!(
-                        "selected: {default_key} · empty = try whole keyring"
-                    ))],
-                    sel: 0,
-                    strength_meter: false,
-                    action: PendingAction::DecryptKey(p),
-                });
+                match crate::crypto::inspect(&p) {
+                    // conteneur destinataires → choix de la clé keyring.
+                    Ok(h) if h.is_recipient_mode() => {
+                        let default_key = app
+                            .keyring
+                            .get(app.keys_sel)
+                            .map(|(n, _, _)| n.clone())
+                            .unwrap_or_default();
+                        app.modal = Some(Modal::Input {
+                            title: format!("DECRYPT WITH KEY — {cleaned}"),
+                            fields: vec![Field::plain("key name").hint(format!(
+                                "selected: {default_key} · empty = try whole keyring"
+                            ))],
+                            sel: 0,
+                            strength_meter: false,
+                            action: PendingAction::DecryptKey(p),
+                        });
+                    }
+                    // mot de passe → modale passphrase normale.
+                    Ok(_) => {
+                        app.modal = Some(Modal::Input {
+                            title: format!("DECRYPT — {cleaned}"),
+                            fields: vec![Field::masked("passphrase")],
+                            sel: 0,
+                            strength_meter: false,
+                            action: PendingAction::Decrypt(p),
+                        });
+                    }
+                    Err(_) => app.toast("not an .aos container"),
+                }
             } else {
                 app.toast("drop an .aos container here to decrypt it");
             }
