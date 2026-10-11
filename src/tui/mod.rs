@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::config::{Config, Mode};
 use crate::error::Result;
-use app::{App, Field, Level, Modal, PendingAction, Screen, Tab};
+use app::{App, CryptMode, Field, Level, Modal, PendingAction, Screen, Tab};
 
 /// Lance le TUI. Sans TTY (pipe/CI) : message et retour propre.
 pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
@@ -32,7 +32,12 @@ pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        cursor::Hide,
+        event::EnableBracketedPaste
+    )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(config, no_anim);
@@ -42,7 +47,12 @@ pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
 
     // Restore systématique, même en cas d'erreur.
     let _ = disable_raw_mode();
-    let _ = execute!(term.backend_mut(), LeaveAlternateScreen, cursor::Show);
+    let _ = execute!(
+        term.backend_mut(),
+        event::DisableBracketedPaste,
+        LeaveAlternateScreen,
+        cursor::Show
+    );
     res
 }
 
@@ -89,6 +99,9 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
                 Event::Resize(w, h) => app.rain.resize(w, h),
+                // Drag & drop : le terminal colle le chemin du fichier
+                // (bracketed paste) → on le sélectionne comme cible.
+                Event::Paste(text) => on_paste(app, &text),
                 _ => {}
             }
         }
@@ -132,6 +145,7 @@ fn drain_worker(app: &mut App) {
             app::WorkerMsg::Done(msg) => {
                 app.push_log(Level::Ok, msg.clone());
                 app.toast(msg);
+                app.ops_done += 1;
                 app.modal = None;
             }
             app::WorkerMsg::Err(msg) => {
@@ -187,19 +201,6 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
-    // Champ de saisie QR : capture du texte en priorité.
-    if app.tab == Tab::Transfer && app.qr_edit {
-        match k.code {
-            KeyCode::Esc | KeyCode::Enter => app.qr_edit = false,
-            KeyCode::Backspace => {
-                app.qr_input.pop();
-            }
-            KeyCode::Char(c) if !ctrl => app.qr_input.push(c),
-            _ => {}
-        }
-        return;
-    }
-
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('?') => app.help_open = true,
@@ -215,128 +216,274 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::BackTab | KeyCode::Left => {
             app.tab = Tab::from_idx(app.tab.idx() + Tab::ALL.len() - 1)
         }
-        KeyCode::Char(c @ '1'..='8') => app.tab = Tab::from_idx((c as usize) - ('1' as usize)),
+        KeyCode::Char(c @ '1'..='6') => app.tab = Tab::from_idx((c as usize) - ('1' as usize)),
         _ => on_tab_key(app, k),
     }
 }
 
+/// Drag & drop / paste d'un chemin de fichier → sélection comme cible
+/// dans le picker de l'onglet courant (CRYPT/SHRED) ou ouverture du dossier.
+fn on_paste(app: &mut App, text: &str) {
+    // Si une modale de saisie est ouverte → le texte collé va dans le champ.
+    if let Some(Modal::Input {
+        title,
+        mut fields,
+        sel,
+        strength_meter,
+        action,
+    }) = app.modal.take()
+    {
+        for c in text.chars() {
+            if !c.is_control() {
+                fields[sel].value.push(c);
+            }
+        }
+        app.modal = Some(Modal::Input {
+            title,
+            fields,
+            sel,
+            strength_meter,
+            action,
+        });
+        return;
+    }
+    let cleaned = app::clean_dropped_path(text);
+    if cleaned.is_empty() {
+        return;
+    }
+    let picker = match app.tab {
+        Tab::Crypt => Some(&mut app.picker_vault),
+        Tab::Shred => Some(&mut app.picker_shred),
+        _ => None,
+    };
+    let Some(p) = picker else {
+        app.toast("drop files onto CRYPT or SHRED tabs");
+        return;
+    };
+    if p.jump(&cleaned) {
+        let name = p
+            .target
+            .as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| cleaned.clone());
+        app.push_log(Level::Ok, format!("dropped → {name}"));
+        app.toast(format!("target: {name}"));
+    } else {
+        app.toast("dropped path not found");
+        app.push_log(Level::Warn, format!("drop ignored: {cleaned}"));
+    }
+}
+
+/// Touches communes des file pickers — navigation (j)saut, (h)ome,
+/// backspace parent. Retourne vrai si la touche est consommée.
+fn picker_nav(app: &mut App, k: &KeyEvent, shred: bool) -> bool {
+    let picker = if shred {
+        &mut app.picker_shred
+    } else {
+        &mut app.picker_vault
+    };
+    match k.code {
+        KeyCode::Up => picker.move_sel(-1),
+        KeyCode::Down => picker.move_sel(1),
+        KeyCode::Enter => picker.activate(),
+        KeyCode::Backspace => {
+            if let Some(par) = picker.dir.parent().map(|p| p.to_path_buf()) {
+                picker.dir = par;
+                picker.sel = 0;
+                picker.refresh();
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Home => picker.home(),
+        KeyCode::Char('j') => {
+            app.modal = Some(Modal::Input {
+                title: "JUMP TO PATH".into(),
+                fields: vec![
+                    Field::plain("path").hint("absolute or relative path · folder or file"),
+                ],
+                sel: 0,
+                strength_meter: false,
+                action: PendingAction::JumpPath(shred),
+            });
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn on_tab_key(app: &mut App, k: KeyEvent) {
     match app.tab {
-        Tab::Vault => match k.code {
-            KeyCode::Up => app.picker_vault.move_sel(-1),
-            KeyCode::Down => app.picker_vault.move_sel(1),
-            KeyCode::Enter => app.picker_vault.activate(),
-            KeyCode::Char('c') => {
-                use crate::crypto::CipherSuite as S;
-                app.vault_suite = match app.vault_suite {
-                    S::XChaCha20 => S::Aes256Gcm,
-                    S::Aes256Gcm => S::Cascade,
-                    S::Cascade => S::XChaCha20,
+        Tab::Dashboard => match k.code {
+            KeyCode::Char('x') => {
+                app.mode = match app.mode {
+                    Mode::Standard => Mode::Expert,
+                    Mode::Expert => Mode::Standard,
                 };
-                app.toast(format!("cipher: {}", app.vault_suite.label()));
+                app.toast(format!("mode: {:?}", app.mode).to_lowercase());
             }
-            KeyCode::Char('z') => app.vault_compress = !app.vault_compress,
-            KeyCode::Char('g') => app.vault_pad = !app.vault_pad,
-            KeyCode::Char('o') => {
-                app.vault_shred_orig = !app.vault_shred_orig;
-                if app.vault_shred_orig {
-                    app.toast("original will be shredded after encrypt");
+            KeyCode::Char('a') => {
+                // Presets Argon2 : Standard 64Mio ↔ Paranoid 512Mio.
+                app.argon2 = if app.argon2.m_kib >= 512 * 1024 {
+                    crate::crypto::Argon2Params::default()
+                } else {
+                    crate::crypto::Argon2Params::PARANOID
+                };
+                app.toast(format!("argon2: {} MiB", app.argon2.m_kib / 1024));
+            }
+            KeyCode::Char('w') => save_config(app),
+            _ => {}
+        },
+        Tab::Crypt => {
+            if picker_nav(app, &k, false) {
+                return;
+            }
+            match k.code {
+                KeyCode::Char('m') => {
+                    app.crypt_mode = match app.crypt_mode {
+                        CryptMode::Password => CryptMode::Recipients,
+                        CryptMode::Recipients => CryptMode::Password,
+                    };
+                    app.toast(match app.crypt_mode {
+                        CryptMode::Password => "auth: passphrase".to_string(),
+                        CryptMode::Recipients => {
+                            "auth: recipient public keys (post-quantum)".to_string()
+                        }
+                    });
                 }
-            }
-            KeyCode::Char('e') => {
-                if let Some(t) = app.picker_vault.target.clone() {
+                KeyCode::Char('c') => {
+                    use crate::crypto::CipherSuite as S;
+                    app.vault_suite = match app.vault_suite {
+                        S::XChaCha20 => S::Aes256Gcm,
+                        S::Aes256Gcm => S::Cascade,
+                        S::Cascade => S::XChaCha20,
+                    };
+                    app.toast(format!("cipher: {}", app.vault_suite.label()));
+                }
+                KeyCode::Char('z') => app.vault_compress = !app.vault_compress,
+                KeyCode::Char('g') => app.vault_pad = !app.vault_pad,
+                KeyCode::Char('o') => {
+                    app.vault_shred_orig = !app.vault_shred_orig;
+                    if app.vault_shred_orig {
+                        app.toast("original will be shredded after encrypt");
+                    }
+                }
+                KeyCode::Char('e') => {
+                    let Some(t) = app.picker_vault.target.clone() else {
+                        app.toast("select a target file first");
+                        return;
+                    };
                     if t.path.extension().and_then(|e| e.to_str()) == Some("aos") {
                         app.toast("already an .aos container");
+                        return;
+                    }
+                    match app.crypt_mode {
+                        CryptMode::Password => {
+                            app.modal = Some(Modal::Input {
+                                title: format!("ENCRYPT — {}", t.name),
+                                fields: vec![
+                                    Field::masked("passphrase").hint("[tab] next · empty = abort"),
+                                    Field::masked("confirm"),
+                                ],
+                                sel: 0,
+                                strength_meter: true,
+                                action: PendingAction::Encrypt(t.path.clone()),
+                            });
+                        }
+                        CryptMode::Recipients => {
+                            let names: String = app
+                                .keyring
+                                .iter()
+                                .map(|(n, _, _)| n.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            app.modal = Some(Modal::Input {
+                                title: format!("ENCRYPT TO RECIPIENTS — {}", t.name),
+                                fields: vec![
+                                    Field::plain("recipients")
+                                        .hint(format!("keyring: {names} · comma-separated names")),
+                                ],
+                                sel: 0,
+                                strength_meter: false,
+                                action: PendingAction::EncryptTo(t.path.clone()),
+                            });
+                        }
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(t) = app.picker_vault.target.clone() {
+                        match crate::crypto::inspect(&t.path) {
+                            Ok(h) if h.is_password_mode() => {
+                                app.modal = Some(Modal::Input {
+                                    title: format!("DECRYPT — {}", t.name),
+                                    fields: vec![Field::masked("passphrase")],
+                                    sel: 0,
+                                    strength_meter: false,
+                                    action: PendingAction::Decrypt(t.path.clone()),
+                                });
+                            }
+                            Ok(h) => {
+                                let fps: Vec<String> =
+                                    h.recipients.iter().map(|r| r.fingerprint.clone()).collect();
+                                app.modal = Some(Modal::Input {
+                                    title: format!("DECRYPT — {}", t.name),
+                                    fields: vec![Field::plain("key name").hint(format!(
+                                        "slots: {} · empty = try whole keyring",
+                                        fps.join(", ")
+                                    ))],
+                                    sel: 0,
+                                    strength_meter: false,
+                                    action: PendingAction::DecryptKey(t.path.clone()),
+                                });
+                            }
+                            Err(_) => app.toast("not an .aos container"),
+                        }
                     } else {
-                        app.modal = Some(Modal::Input {
-                            title: format!("ENCRYPT — {}", t.name),
-                            fields: vec![
-                                Field::masked("passphrase").hint("[tab] next · empty = abort"),
-                                Field::masked("confirm"),
+                        app.toast("select a target file first");
+                    }
+                }
+                KeyCode::Char('i') => {
+                    if let Some(t) = app.picker_vault.target.clone() {
+                        match crate::crypto::inspect(&t.path) {
+                            Ok(h) => app.modal = Some(header_modal(&h)),
+                            Err(e) => {
+                                app.modal = Some(Modal::Info {
+                                    title: "NOT A CONTAINER".into(),
+                                    lines: vec![e.to_string()],
+                                })
+                            }
+                        }
+                    } else {
+                        app.toast("select a target file first");
+                    }
+                }
+                _ => {}
+            }
+        }
+        Tab::Shred => {
+            if picker_nav(app, &k, true) {
+                return;
+            }
+            match k.code {
+                KeyCode::Char('[') => app.shred_passes = (app.shred_passes - 1).max(1),
+                KeyCode::Char(']') => app.shred_passes = (app.shred_passes + 1).min(35),
+                KeyCode::Char('s') => {
+                    if let Some(t) = &app.picker_shred.target {
+                        let name = t.name.clone();
+                        app.modal = Some(Modal::Confirm {
+                            title: "CONFIRM SHRED".into(),
+                            lines: vec![
+                                format!("irreversibly destroy: {name}"),
+                                format!("passes: {}", app.shred_passes),
+                                "fs caveat: SSD/journal/CoW may retain blocks".into(),
                             ],
-                            sel: 0,
-                            strength_meter: true,
-                            action: PendingAction::Encrypt(t.path.clone()),
+                            action: PendingAction::Shred(t.path.clone()),
                         });
+                    } else {
+                        app.toast("select a target file first");
                     }
-                } else {
-                    app.toast("select a target file first");
                 }
+                _ => {}
             }
-            KeyCode::Char('d') => {
-                if let Some(t) = app.picker_vault.target.clone() {
-                    match crate::crypto::inspect(&t.path) {
-                        Ok(h) if h.is_password_mode() => {
-                            app.modal = Some(Modal::Input {
-                                title: format!("DECRYPT — {}", t.name),
-                                fields: vec![Field::masked("passphrase")],
-                                sel: 0,
-                                strength_meter: false,
-                                action: PendingAction::Decrypt(t.path.clone()),
-                            });
-                        }
-                        Ok(h) => {
-                            let fps: Vec<String> =
-                                h.recipients.iter().map(|r| r.fingerprint.clone()).collect();
-                            app.modal = Some(Modal::Input {
-                                title: format!("DECRYPT — {}", t.name),
-                                fields: vec![Field::plain("key name").hint(format!(
-                                    "slots: {} · empty = try whole keyring",
-                                    fps.join(", ")
-                                ))],
-                                sel: 0,
-                                strength_meter: false,
-                                action: PendingAction::DecryptKey(t.path.clone()),
-                            });
-                        }
-                        Err(_) => app.toast("not an .aos container"),
-                    }
-                } else {
-                    app.toast("select a target file first");
-                }
-            }
-            KeyCode::Char('i') => {
-                if let Some(t) = app.picker_vault.target.clone() {
-                    match crate::crypto::inspect(&t.path) {
-                        Ok(h) => app.modal = Some(header_modal(&h)),
-                        Err(e) => {
-                            app.modal = Some(Modal::Info {
-                                title: "NOT A CONTAINER".into(),
-                                lines: vec![e.to_string()],
-                            })
-                        }
-                    }
-                } else {
-                    app.toast("select a target file first");
-                }
-            }
-            _ => {}
-        },
-        Tab::Shred => match k.code {
-            KeyCode::Up => app.picker_shred.move_sel(-1),
-            KeyCode::Down => app.picker_shred.move_sel(1),
-            KeyCode::Enter => app.picker_shred.activate(),
-            KeyCode::Home => app.shred_passes = 1,
-            KeyCode::Char('[') => app.shred_passes = (app.shred_passes - 1).max(1),
-            KeyCode::Char(']') => app.shred_passes = (app.shred_passes + 1).min(35),
-            KeyCode::Char('s') => {
-                if let Some(t) = &app.picker_shred.target {
-                    let name = t.name.clone();
-                    app.modal = Some(Modal::Confirm {
-                        title: "CONFIRM SHRED".into(),
-                        lines: vec![
-                            format!("irreversibly destroy: {name}"),
-                            format!("passes: {}", app.shred_passes),
-                            "fs caveat: SSD/journal/CoW may retain blocks".into(),
-                        ],
-                        action: PendingAction::Shred(t.path.clone()),
-                    });
-                } else {
-                    app.toast("select a target file first");
-                }
-            }
-            _ => {}
-        },
+        }
         Tab::Keys => match k.code {
             KeyCode::Up => app.keys_sel = app.keys_sel.saturating_sub(1),
             KeyCode::Down if !app.keyring.is_empty() => {
@@ -346,7 +493,7 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
                 app.modal = Some(Modal::Input {
                     title: "GENERATE X-WING KEYPAIR".into(),
                     fields: vec![
-                        Field::plain("name").hint("x25519 + ml-kem-768 · stored in keyring"),
+                        Field::plain("name").hint("x25519 + ml-kem-768 · empty = random name"),
                     ],
                     sel: 0,
                     strength_meter: false,
@@ -387,21 +534,6 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
             }
             _ => {}
         },
-        Tab::Transfer => {
-            if matches!(k.code, KeyCode::Enter | KeyCode::Char('e')) {
-                app.qr_edit = true;
-            }
-        }
-        Tab::Settings => match k.code {
-            KeyCode::Up => {
-                app.settings_sel = app.settings_sel.saturating_sub(1);
-            }
-            KeyCode::Down => app.settings_sel = (app.settings_sel + 1).min(6),
-            KeyCode::Left => settings_adjust(app, -1),
-            KeyCode::Right => settings_adjust(app, 1),
-            KeyCode::Enter => settings_apply(app),
-            _ => {}
-        },
         Tab::Logs => match k.code {
             KeyCode::Up => app.log_scroll = app.log_scroll.saturating_add(1),
             KeyCode::Down => app.log_scroll = app.log_scroll.saturating_sub(1),
@@ -413,55 +545,22 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
     }
 }
 
-fn settings_adjust(app: &mut App, dir: i64) {
-    let expert = app.mode == Mode::Expert;
-    match app.settings_sel {
-        0 => {
-            app.mode = match app.mode {
-                Mode::Standard => Mode::Expert,
-                Mode::Expert => Mode::Standard,
-            };
+fn save_config(app: &mut App) {
+    let cfg = Config {
+        mode: app.mode,
+        theme: app.theme().name.into(),
+        boot_anim: app.boot_anim,
+        argon2: app.argon2,
+    };
+    match cfg.save() {
+        Ok(p) => {
+            app.toast("config saved");
+            app.push_log(Level::Ok, format!("config written → {}", p.display()));
         }
-        1 => {
-            let n = theme::THEMES.len() as i64;
-            app.theme_idx = ((app.theme_idx as i64 + dir).rem_euclid(n)) as usize;
+        Err(e) => {
+            app.toast("save failed");
+            app.push_log(Level::Err, format!("config save failed: {e}"));
         }
-        2 => app.boot_anim = !app.boot_anim,
-        3 if expert => {
-            app.argon2.m_kib =
-                (app.argon2.m_kib as i64 + dir * 32 * 1024).clamp(8 * 1024, 2 * 1024 * 1024) as u32;
-        }
-        4 if expert => {
-            app.argon2.t = (app.argon2.t as i64 + dir).clamp(1, 10) as u32;
-        }
-        5 if expert => {
-            app.argon2.p = (app.argon2.p as i64 + dir).clamp(1, 8) as u32;
-        }
-        3..=5 => app.toast("expert mode required to tune kdf params"),
-        _ => {}
-    }
-}
-
-fn settings_apply(app: &mut App) {
-    if app.settings_sel == 6 {
-        let cfg = Config {
-            mode: app.mode,
-            theme: app.theme().name.into(),
-            boot_anim: app.boot_anim,
-            argon2: app.argon2,
-        };
-        match cfg.save() {
-            Ok(p) => {
-                app.toast("config saved");
-                app.push_log(Level::Ok, format!("config written → {}", p.display()));
-            }
-            Err(e) => {
-                app.toast("save failed");
-                app.push_log(Level::Err, format!("config save failed: {e}"));
-            }
-        }
-    } else {
-        settings_adjust(app, 1);
     }
 }
 
@@ -643,6 +742,53 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
                 Ok(msg)
             });
         }
+        PendingAction::EncryptTo(path) => {
+            let raw = val(0);
+            let names: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('@').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if names.is_empty() {
+                app.toast("no recipient given — aborted");
+                return;
+            }
+            let mut pubs = Vec::new();
+            for n in &names {
+                match crate::crypto::keys::load_public(n) {
+                    Ok(p) => pubs.push(p),
+                    Err(e) => {
+                        app.push_log(Level::Err, format!("recipient '{n}': {e}"));
+                        app.toast(format!("unknown key '{n}' — aborted"));
+                        return;
+                    }
+                }
+            }
+            let out = path.with_file_name(format!(
+                "{}.aos",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let opts = EncryptOptions {
+                suite: app.vault_suite,
+                argon2: app.argon2,
+                compress: app.vault_compress,
+                pad: app.vault_pad,
+                ..Default::default()
+            };
+            let shred_orig = app.vault_shred_orig;
+            let src = path.clone();
+            spawn_worker(app, format!("ENCRYPT →{}", path.display()), move |tx| {
+                engine::encrypt_file(&src, &out, &KeySource::Recipients(pubs), &opts, &mut |d| {
+                    let _ = tx.send(app::WorkerMsg::Progress(d));
+                })?;
+                let mut msg = format!("encrypted → {}", out.display());
+                if shred_orig {
+                    crate::wipe::shred(&src, 3, &mut |_| {})?;
+                    msg.push_str(" · original shredded");
+                }
+                Ok(msg)
+            });
+        }
         PendingAction::Decrypt(path) => {
             let pass = val(0);
             if pass.is_empty() {
@@ -717,6 +863,26 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
             }
             app.keyring = crate::crypto::keys::list().unwrap_or_default();
             app.keys_sel = app.keys_sel.min(app.keyring.len().saturating_sub(1));
+        }
+        PendingAction::JumpPath(shred) => {
+            let p = val(0);
+            let picker = if shred {
+                &mut app.picker_shred
+            } else {
+                &mut app.picker_vault
+            };
+            let dir = picker.dir.display().to_string();
+            let ok = picker.jump(&p);
+            let dir = if ok {
+                picker.dir.display().to_string()
+            } else {
+                dir
+            };
+            if ok {
+                app.toast(format!("→ {dir}"));
+            } else {
+                app.toast("path not found");
+            }
         }
     }
 }
@@ -848,29 +1014,33 @@ mod tests {
     }
 
     #[test]
-    fn qr_input_capture_and_render() {
-        let cfg = Config::default();
-        let mut app = App::new(&cfg, true);
-        app.tab = Tab::Transfer;
-        on_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
-        );
-        on_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE),
-        );
-        assert_eq!(app.qr_input, "AB");
-        let mut t = term();
-        t.draw(|f| ui::draw(f, &mut app)).unwrap();
-    }
-
-    #[test]
-    fn transfer_tab_tab_cycles() {
+    fn tab_cycles_from_dash() {
         let cfg = Config::default();
         let mut app = App::new(&cfg, true);
         on_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.tab, Tab::Vault);
+        assert_eq!(app.tab, Tab::Crypt);
+    }
+
+    #[test]
+    fn picker_jump_selects_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("secret.txt");
+        std::fs::write(&f, b"data").unwrap();
+        let mut p = app::FilePicker::new();
+        assert!(p.jump(f.to_str().unwrap()));
+        assert_eq!(p.target.as_ref().unwrap().name, "secret.txt");
+        // dossier → navigation dedans
+        assert!(p.jump(tmp.path().to_str().unwrap()));
+        assert_eq!(p.dir, tmp.path());
+    }
+
+    #[test]
+    fn clean_dropped_path_handles_quotes() {
+        assert_eq!(
+            app::clean_dropped_path("  \"C:\\foo\\bar baz.txt\"  "),
+            "C:\\foo\\bar baz.txt"
+        );
+        assert_eq!(app::clean_dropped_path("& 'C:\\x y.txt'"), "C:\\x y.txt");
     }
 
     #[test]

@@ -70,17 +70,44 @@ ats-opsec bench                                  # argon2 calib + aead speed
 - **Boot sequence** — matrix rain, decoding ASCII logo, module init
   checklist fed by a *real* system probe (CSPRNG, CPUID features,
   hypervisor bit, memory locking, filesystem type, tracer detection).
-- **8 keyboard-driven modules** — `←→`/`tab`/`1-8` to navigate:
-  DASH (profile + OPSEC score) · VAULT (picker + real encrypt/decrypt/audit
-  with live cipher/compress/pad toggles) · STEGO · SHRED (real multi-pass
-  overwrite, worker progress) · XFER (live QR render) · KEYS (X-Wing
-  keyring: gen/export/delete) · CFG (standard/expert, Argon2 params,
-  themes) · LOGS.
+- **6 keyboard-driven modules** — `←→`/`tab`/`1-6` to navigate:
+  DASH (host profile, OPSEC score, prefs, local time) ·
+  CRYPT (encrypt/decrypt/audit — passphrase *or* recipients mode) ·
+  STEGO · SHRED (real multi-pass overwrite) · KEYS (X-Wing keyring) ·
+  LOGS.
+- **Drag & drop** — drop a file onto the terminal on CRYPT or SHRED
+  and it becomes the target. `j` jumps to any path, `h` goes home,
+  `backspace` climbs up, drive letters appear at the filesystem root.
 - **Input modals** — masked passphrase entry with live zxcvbn strength
   meter; long ops run in background workers with progress.
 - **`p` panic screen** — instant decoy (innocent PowerShell session).
 - **`?` help overlay**, `t` theme cycle (cyber/amber/ice/crimson),
   `q`/`ctrl+c` quit.
+
+## Keys vs passwords — the two ways to lock a file
+
+Every encryption needs a key. Where it comes from defines two modes:
+
+**Passphrase mode** (symmetric) — your passphrase *is* the key, stretched
+through Argon2id (~1.6 s, 64 MiB — brute-force gets expensive fast).
+Use it for **your own files**, or when you can whisper the secret to
+the recipient.
+
+**Recipient mode** (asymmetric, post-quantum) — each keyring entry is an
+X-Wing pair: a **public key** (an open padlock you hand out — anyone can
+lock a file for you, nobody can open it) and a **secret key** (yours
+alone, the only thing that unlocks). To send a file without sharing any
+password:
+
+```
+you:    ats-opsec keys pub alice → give alice the .pub file / hex
+alice:  ats-opsec encrypt report.pdf --to alice   # locks to YOUR padlock
+you:    ats-opsec decrypt report.pdf.aos --key alice   # only YOUR sec key opens it
+```
+
+X-Wing combines X25519 + ML-KEM-768 (FIPS 203): safe even if one half is
+broken — including by future quantum computers (protects against
+"harvest now, decrypt later" collection of today's ciphertext).
 
 ## `.aos` container (v1)
 

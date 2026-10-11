@@ -19,36 +19,30 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
-    Vault,
+    Crypt,
     Stego,
     Shred,
-    Transfer,
     Keys,
-    Settings,
     Logs,
 }
 
 impl Tab {
     pub const ALL: &'static [Tab] = &[
         Tab::Dashboard,
-        Tab::Vault,
+        Tab::Crypt,
         Tab::Stego,
         Tab::Shred,
-        Tab::Transfer,
         Tab::Keys,
-        Tab::Settings,
         Tab::Logs,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Dashboard => "DASH",
-            Tab::Vault => "VAULT",
+            Tab::Crypt => "CRYPT",
             Tab::Stego => "STEGO",
             Tab::Shred => "SHRED",
-            Tab::Transfer => "XFER",
             Tab::Keys => "KEYS",
-            Tab::Settings => "CFG",
             Tab::Logs => "LOGS",
         }
     }
@@ -123,8 +117,72 @@ impl FilePicker {
             is_dir: true,
             size: 0,
         });
-        self.entries = parent.into_iter().chain(dirs).chain(files).collect();
+        // À la racine (pas de parent) : proposer les lettres de lecteurs.
+        let drives: Vec<FileEntry> = if parent.is_none() {
+            drive_entries()
+        } else {
+            Vec::new()
+        };
+        self.entries = parent
+            .into_iter()
+            .chain(drives)
+            .chain(dirs)
+            .chain(files)
+            .collect();
         self.sel = self.sel.min(self.entries.len().saturating_sub(1));
+    }
+
+    /// Saut direct vers un chemin (collé / tapé) : dossier → navigation,
+    /// fichier → sélection comme cible + focus sur le dossier parent.
+    pub fn jump(&mut self, raw: &str) -> bool {
+        let cleaned = clean_dropped_path(raw);
+        let p = PathBuf::from(&cleaned);
+        if !p.exists() {
+            return false;
+        }
+        if p.is_dir() {
+            self.dir = p;
+            self.sel = 0;
+            self.target = None;
+            self.refresh();
+            return true;
+        }
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.dir = p.parent().map(|d| d.to_path_buf()).unwrap_or(p.clone());
+        self.refresh();
+        self.sel = self
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap_or(0);
+        self.target = Some(FileEntry {
+            name,
+            path: p,
+            is_dir: false,
+            size: std::fs::metadata(
+                self.entries
+                    .get(self.sel)
+                    .map(|e| e.path.clone())
+                    .unwrap_or_default(),
+            )
+            .map(|m| m.len())
+            .unwrap_or(0),
+        });
+        self.hash_cache = None;
+        true
+    }
+
+    /// Home de l'utilisateur.
+    pub fn home(&mut self) {
+        if let Some(h) = dirs::home_dir() {
+            self.dir = h;
+            self.sel = 0;
+            self.target = None;
+            self.refresh();
+        }
     }
 
     pub fn selected(&self) -> Option<&FileEntry> {
@@ -170,6 +228,46 @@ impl FilePicker {
         self.hash_cache = Some((path, h.clone()));
         Some(h)
     }
+}
+
+/// Nettoie un chemin venant d'un drag & drop / paste terminal :
+/// guillemets, `& ` PowerShell, préfixe `file://`.
+pub fn clean_dropped_path(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if let Some(rest) = s.strip_prefix('&') {
+        s = rest.trim().to_string();
+    }
+    if let Some(rest) = s.strip_prefix("file://") {
+        s = rest.to_string();
+    }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        s = s[1..s.len() - 1].to_string();
+    }
+    if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+        s = s[1..s.len() - 1].to_string();
+    }
+    s
+}
+
+/// Entrées `C:\`, `D:\`… pour la racine (Windows uniquement).
+#[cfg(windows)]
+fn drive_entries() -> Vec<FileEntry> {
+    (b'A'..=b'Z')
+        .filter_map(|c| {
+            let p = PathBuf::from(format!("{}:\\", c as char));
+            p.exists().then(|| FileEntry {
+                name: format!("{}:\\", c as char),
+                path: p,
+                is_dir: true,
+                size: 0,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn drive_entries() -> Vec<FileEntry> {
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +337,8 @@ pub enum PendingAction {
     Shred(PathBuf),
     /// fields: [password, confirm]
     Encrypt(PathBuf),
+    /// fields: [recipients, comma-sep names]
+    EncryptTo(PathBuf),
     /// fields: [password]
     Decrypt(PathBuf),
     /// fields: [key name or .sec path]
@@ -246,6 +346,17 @@ pub enum PendingAction {
     /// fields: [name]
     Keygen,
     DeleteKey(String),
+    /// fields: [path] — true = picker shred, false = picker crypt.
+    JumpPath(bool),
+}
+
+/// Mode de chiffrement dans l'onglet CRYPT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptMode {
+    /// Mot de passe → Argon2id → clé symétrique.
+    Password,
+    /// Clés publiques X-Wing de destinataires → partage sans mot de passe.
+    Recipients,
 }
 
 /// Message d'un thread worker vers la UI.
@@ -280,9 +391,6 @@ pub struct App {
     pub picker_vault: FilePicker,
     pub picker_shred: FilePicker,
     pub shred_passes: usize,
-    pub settings_sel: usize,
-    pub qr_input: String,
-    pub qr_edit: bool,
     pub log_scroll: u16,
     /// Fenêtre de transition glitch après boot/panic.
     pub transition_end: Option<Instant>,
@@ -294,6 +402,10 @@ pub struct App {
     pub vault_compress: bool,
     pub vault_pad: bool,
     pub vault_shred_orig: bool,
+    /// Mode d'authentification de l'onglet CRYPT.
+    pub crypt_mode: CryptMode,
+    /// Opérations réussies cette session (compteur dashboard).
+    pub ops_done: u32,
     /// Keyring (nom, fingerprint, a_secret).
     pub keyring: Vec<(String, String, bool)>,
     pub keys_sel: usize,
@@ -323,9 +435,6 @@ impl App {
             picker_vault: FilePicker::new(),
             picker_shred: FilePicker::new(),
             shred_passes: 3,
-            settings_sel: 0,
-            qr_input: String::new(),
-            qr_edit: true,
             log_scroll: 0,
             transition_end: None,
             status_msg: None,
@@ -334,6 +443,8 @@ impl App {
             vault_compress: false,
             vault_pad: false,
             vault_shred_orig: false,
+            crypt_mode: CryptMode::Password,
+            ops_done: 0,
             keyring: crate::crypto::keys::list().unwrap_or_default(),
             keys_sel: 0,
         }

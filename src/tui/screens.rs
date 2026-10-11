@@ -2,26 +2,24 @@
 //! (QR live), keys, settings, logs.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table, Widget,
 };
 
-use super::app::{App, FilePicker, Tab};
+use super::app::{App, CryptMode, FilePicker, Tab};
 use super::theme::Theme;
 use crate::config::Mode;
 
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     match app.tab {
         Tab::Dashboard => dashboard(f, area, app, theme),
-        Tab::Vault => vault(f, area, app, theme),
+        Tab::Crypt => crypt(f, area, app, theme),
         Tab::Stego => stego(f, area, app, theme),
         Tab::Shred => shred(f, area, app, theme),
-        Tab::Transfer => transfer(f, area, app, theme),
         Tab::Keys => keys(f, area, app, theme),
-        Tab::Settings => settings(f, area, app, theme),
         Tab::Logs => logs(f, area, app, theme),
     }
 }
@@ -166,7 +164,7 @@ fn dashboard(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         )),
         Line::from(Span::styled(
             format!(
-                "mode: {}",
+                "mode: {} · [x] toggle",
                 if app.mode == Mode::Expert {
                     "expert"
                 } else {
@@ -174,6 +172,14 @@ fn dashboard(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 }
             ),
             Style::default().fg(theme.fg),
+        )),
+        Line::from(Span::styled(
+            format!("ops done: {} · keys: {}", app.ops_done, app.keyring.len()),
+            Style::default().fg(theme.fg),
+        )),
+        Line::from(Span::styled(
+            format!("argon2: {}MiB [a] · [w] save cfg", app.argon2.m_kib / 1024),
+            Style::default().fg(theme.dim),
         )),
         Line::from(Span::styled(
             if p.cpu.hypervisor == Some(true) || p.tracer_detected == Some(true) {
@@ -254,13 +260,13 @@ fn dashboard(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 // ---------------------------------------------------------------- vault
 
-fn vault(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+fn crypt(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(area);
 
-    draw_picker(f, cols[0], &app.picker_vault, app.tab == Tab::Vault, theme);
+    draw_picker(f, cols[0], &app.picker_vault, app.tab == Tab::Crypt, theme);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -310,7 +316,7 @@ fn vault(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .block(panel("TARGET", theme))
         .render(right[0], f.buffer_mut());
 
-    // Actions + options live.
+    // Actions + options live, catégorisées par niveau.
     let on = |b: bool| {
         if b {
             ("on ", theme.ok)
@@ -319,41 +325,62 @@ fn vault(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         }
     };
     let (zc, zo) = (on(app.vault_compress), on(app.vault_shred_orig));
-    let (gc, _go) = (on(app.vault_pad), on(false));
+    let gc = on(app.vault_pad);
+    let (mode_s, mode_c) = match app.crypt_mode {
+        CryptMode::Password => ("passphrase (argon2id)", theme.fg),
+        CryptMode::Recipients => ("recipient keys — POST-QUANTUM", theme.accent2),
+    };
+    let tier = match app.vault_suite {
+        crate::crypto::CipherSuite::Cascade => ("MAX", theme.accent2),
+        crate::crypto::CipherSuite::XChaCha20 => ("STRONG", theme.ok),
+        crate::crypto::CipherSuite::Aes256Gcm => ("STRONG·AES-NI", theme.ok),
+    };
     let actions = vec![
         Line::from(vec![
             Span::styled("[e] ", Style::default().fg(theme.accent)),
-            Span::raw("encrypt → .aos    "),
+            Span::raw("encrypt  "),
             Span::styled("[d] ", Style::default().fg(theme.accent)),
-            Span::raw("decrypt    "),
+            Span::raw("decrypt  "),
             Span::styled("[i] ", Style::default().fg(theme.accent)),
-            Span::raw("header audit"),
+            Span::raw("audit  "),
+            Span::styled("[drop]", Style::default().fg(theme.dim)),
+            Span::raw(" = select file"),
         ]),
         Line::from(""),
         Line::from(vec![
+            Span::styled("[m] ", Style::default().fg(theme.accent)),
+            Span::raw("auth mode   "),
+            Span::styled(mode_s, Style::default().fg(mode_c)),
+        ]),
+        Line::from(vec![
             Span::styled("[c] ", Style::default().fg(theme.accent)),
-            Span::raw("cipher  "),
+            Span::raw("cipher      "),
             Span::styled(
                 format!("{:<22}", app.vault_suite.label()),
-                Style::default().fg(theme.accent2),
+                Style::default().fg(theme.fg),
             ),
+            Span::styled(tier.0, Style::default().fg(tier.1)),
         ]),
         Line::from(vec![
             Span::styled("[z] ", Style::default().fg(theme.accent)),
-            Span::raw("compress  "),
+            Span::raw("compress    "),
             Span::styled(zc.0, Style::default().fg(zc.1)),
-            Span::raw("   [g] pad-size  "),
+            Span::raw("   [g] pad-size    "),
             Span::styled(gc.0, Style::default().fg(gc.1)),
         ]),
         Line::from(vec![
             Span::styled("[o] ", Style::default().fg(theme.accent)),
-            Span::raw("shred original after encrypt  "),
+            Span::raw("shred orig  "),
             Span::styled(zo.0, Style::default().fg(zo.1)),
+            Span::styled(
+                "   [j] jump  [h] home  [⬅] up",
+                Style::default().fg(theme.dim),
+            ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             format!(
-                "kdf: argon2id m={}KiB t={} p={}",
+                "kdf argon2id m={}KiB t={} p={}  ([a] on DASH)",
                 app.argon2.m_kib, app.argon2.t, app.argon2.p
             ),
             Style::default().fg(theme.dim),
@@ -555,76 +582,6 @@ fn shred(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .render(right[1], f.buffer_mut());
 }
 
-// ---------------------------------------------------------------- transfer
-
-fn transfer(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    // Ligne d'input.
-    let cursor = if app.qr_edit && (app.tick / 15).is_multiple_of(2) {
-        "█"
-    } else {
-        " "
-    };
-    let input = Paragraph::new(format!("{}{}", app.qr_input, cursor))
-        .block(panel("QR PAYLOAD — type to edit", theme));
-    input.render(rows[0], f.buffer_mut());
-
-    // QR rendu réel.
-    if app.qr_input.is_empty() {
-        Paragraph::new("type a payload to render a live QR")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(theme.dim))
-            .block(panel("QR CODE", theme))
-            .render(rows[1], f.buffer_mut());
-    } else {
-        match qrcode::QrCode::new(app.qr_input.as_bytes()) {
-            Ok(code) => {
-                let s = code
-                    .render::<qrcode::render::unicode::Dense1x2>()
-                    .quiet_zone(true)
-                    .dark_color(qrcode::render::unicode::Dense1x2::Dark)
-                    .light_color(qrcode::render::unicode::Dense1x2::Light)
-                    .build();
-                Paragraph::new(s)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::Black).bg(Color::White))
-                    .block(panel("QR CODE — STATIC", theme))
-                    .render(rows[1], f.buffer_mut());
-            }
-            Err(_) => {
-                Paragraph::new(
-                    "payload too large for a single QR — animated RaptorQ fountain lands in v0.2",
-                )
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(theme.warn))
-                .block(panel("QR CODE", theme))
-                .render(rows[1], f.buffer_mut());
-            }
-        }
-    }
-
-    let footer = Line::from(vec![
-        Span::styled("mode: ", Style::default().fg(theme.dim)),
-        Span::styled("static single-qr", Style::default().fg(theme.ok)),
-        Span::styled("   planned: ", Style::default().fg(theme.dim)),
-        Span::styled(
-            "animated tx (raptorq) · webcam rx · audio fsk",
-            Style::default().fg(theme.accent2),
-        ),
-    ]);
-    Paragraph::new(footer)
-        .alignment(Alignment::Center)
-        .render(rows[2], f.buffer_mut());
-}
-
 // ---------------------------------------------------------------- keys
 
 fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -679,6 +636,42 @@ fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .render(cols[0], f.buffer_mut());
     }
 
+    let rows_r = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(6)])
+        .split(cols[1]);
+
+    // Explainer : comment le chiffrement à clé publique fonctionne ici.
+    let explain = vec![
+        Line::from(vec![Span::styled(
+            "pub key = open padlock you hand out",
+            Style::default().fg(theme.fg),
+        )]),
+        Line::from(Span::styled(
+            "  anyone can LOCK a file for you, nobody can open it",
+            Style::default().fg(theme.dim),
+        )),
+        Line::from(vec![Span::styled(
+            "sec key = your private key — never shared",
+            Style::default().fg(theme.fg),
+        )]),
+        Line::from(Span::styled(
+            "  the ONLY thing that can unlock those files",
+            Style::default().fg(theme.dim),
+        )),
+        Line::from(vec![Span::styled(
+            "xwing = x25519 + ml-kem-768 hybrid",
+            Style::default().fg(theme.accent2),
+        )]),
+        Line::from(Span::styled(
+            "  safe even against future quantum computers",
+            Style::default().fg(theme.dim),
+        )),
+    ];
+    Paragraph::new(explain)
+        .block(panel("HOW IT WORKS", theme))
+        .render(rows_r[0], f.buffer_mut());
+
     let ops = [
         ("[g]", "generate xwing keypair"),
         ("[x]", "export public key (hex)"),
@@ -696,88 +689,16 @@ fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .collect();
     items.push(ListItem::new(""));
     items.push(ListItem::new(Line::from(Span::styled(
-        "⚠ .sec files are currently UNENCRYPTED on disk",
+        "⚠ .sec files are UNENCRYPTED on disk (seal: v0.3)",
         Style::default().fg(theme.warn),
     ))));
     items.push(ListItem::new(Line::from(Span::styled(
-        "  keyring sealed by master passphrase — v0.3",
-        Style::default().fg(theme.dim),
-    ))));
-    items.push(ListItem::new(Line::from(Span::styled(
-        "  encrypt to a recipient: cli `encrypt f --to @name`",
+        "  use: CRYPT [m] recipients mode or `encrypt f --to @name`",
         Style::default().fg(theme.dim),
     ))));
     List::new(items)
         .block(panel("OPERATIONS", theme))
-        .render(cols[1], f.buffer_mut());
-}
-
-// ---------------------------------------------------------------- settings
-
-fn settings(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let expert = app.mode == Mode::Expert;
-    let rows = [
-        (
-            "mode",
-            if expert { "expert" } else { "standard" }.to_string(),
-            true,
-        ),
-        ("theme", app.theme().name.to_string(), true),
-        (
-            "boot animation",
-            if app.boot_anim { "on" } else { "off" }.to_string(),
-            true,
-        ),
-        ("argon2 memory (KiB)", app.argon2.m_kib.to_string(), expert),
-        ("argon2 iterations", app.argon2.t.to_string(), expert),
-        ("argon2 lanes", app.argon2.p.to_string(), expert),
-        ("save config", "write to config.toml".to_string(), true),
-    ];
-    let sel = app.settings_sel.min(rows.len() - 1);
-
-    let items: Vec<ListItem> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (k, v, enabled))| {
-            let c = if *enabled { theme.fg } else { theme.dim };
-            let vc = if *enabled { theme.accent } else { theme.dim };
-            let suffix = if !enabled { "   (expert mode)" } else { "" };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{k:<24}"), Style::default().fg(c)),
-                Span::styled(format!("◀ {v} ▶"), Style::default().fg(vc)),
-                Span::styled(suffix, Style::default().fg(theme.dim)),
-            ]))
-            .style(if i == sel {
-                Style::default().bg(Color::Rgb(30, 50, 45))
-            } else {
-                Style::default()
-            })
-        })
-        .collect();
-
-    let split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(9), Constraint::Length(4)])
-        .split(area);
-    List::new(items)
-        .block(panel("CONFIGURATION", theme))
-        .render(split[0], f.buffer_mut());
-
-    let cfg_path = crate::config::Config::path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "n/a".into());
-    Paragraph::new(vec![
-        Line::from(Span::styled(
-            "↑↓ navigate · ←→ adjust · enter apply/save",
-            Style::default().fg(theme.dim),
-        )),
-        Line::from(Span::styled(
-            format!("file: {cfg_path}"),
-            Style::default().fg(theme.dim),
-        )),
-    ])
-    .block(panel("HELP", theme))
-    .render(split[1], f.buffer_mut());
+        .render(rows_r[1], f.buffer_mut());
 }
 
 // ---------------------------------------------------------------- logs
