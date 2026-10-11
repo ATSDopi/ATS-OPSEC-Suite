@@ -1,0 +1,306 @@
+//! État de l'application TUI — machine à états Boot → Main, onglets,
+//! modales, picker fichiers, log de session, panic screen.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use super::matrix::Rain;
+use super::theme::{self, Theme};
+use crate::config::{Config, Mode};
+use crate::sys::SystemProfile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Boot,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Dashboard,
+    Vault,
+    Stego,
+    Shred,
+    Transfer,
+    Keys,
+    Settings,
+    Logs,
+}
+
+impl Tab {
+    pub const ALL: &'static [Tab] = &[
+        Tab::Dashboard,
+        Tab::Vault,
+        Tab::Stego,
+        Tab::Shred,
+        Tab::Transfer,
+        Tab::Keys,
+        Tab::Settings,
+        Tab::Logs,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Tab::Dashboard => "DASH",
+            Tab::Vault => "VAULT",
+            Tab::Stego => "STEGO",
+            Tab::Shred => "SHRED",
+            Tab::Transfer => "XFER",
+            Tab::Keys => "KEYS",
+            Tab::Settings => "CFG",
+            Tab::Logs => "LOGS",
+        }
+    }
+
+    pub fn idx(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    pub fn from_idx(i: usize) -> Tab {
+        Self::ALL[i % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+#[derive(Debug)]
+pub struct FilePicker {
+    pub dir: PathBuf,
+    pub entries: Vec<FileEntry>,
+    pub sel: usize,
+    /// Fichier actuellement « target » par les actions.
+    pub target: Option<FileEntry>,
+    pub hash_cache: Option<(PathBuf, String)>,
+}
+
+impl FilePicker {
+    pub fn new() -> Self {
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut p = Self {
+            dir,
+            entries: Vec::new(),
+            sel: 0,
+            target: None,
+            hash_cache: None,
+        };
+        p.refresh();
+        p
+    }
+
+    pub fn refresh(&mut self) {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let md = e.metadata().ok();
+                let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = md.map(|m| m.len()).unwrap_or(0);
+                let entry = FileEntry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    path: e.path(),
+                    is_dir,
+                    size,
+                };
+                if is_dir {
+                    dirs.push(entry);
+                } else {
+                    files.push(entry);
+                }
+            }
+        }
+        dirs.sort_by_key(|a| a.name.to_lowercase());
+        files.sort_by_key(|a| a.name.to_lowercase());
+        let parent = self.dir.parent().map(|p| FileEntry {
+            name: "..".into(),
+            path: p.to_path_buf(),
+            is_dir: true,
+            size: 0,
+        });
+        self.entries = parent.into_iter().chain(dirs).chain(files).collect();
+        self.sel = self.sel.min(self.entries.len().saturating_sub(1));
+    }
+
+    pub fn selected(&self) -> Option<&FileEntry> {
+        self.entries.get(self.sel)
+    }
+
+    pub fn move_sel(&mut self, delta: i64) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let n = self.entries.len() as i64;
+        self.sel = ((self.sel as i64 + delta).rem_euclid(n)) as usize;
+    }
+
+    /// Enter : descend dans un dossier, ou sélectionne un fichier comme target.
+    pub fn activate(&mut self) {
+        let Some(e) = self.selected() else { return };
+        if e.is_dir {
+            self.dir = e.path.clone();
+            self.sel = 0;
+            self.refresh();
+        } else {
+            self.target = Some(FileEntry {
+                name: e.name.clone(),
+                path: e.path.clone(),
+                is_dir: false,
+                size: e.size,
+            });
+            self.hash_cache = None;
+        }
+    }
+
+    /// Hash blake3 du target (calcul paresseux, mis en cache).
+    pub fn target_hash(&mut self) -> Option<String> {
+        let path = self.target.as_ref()?.path.clone();
+        if let Some((p, h)) = &self.hash_cache
+            && *p == path
+        {
+            return Some(h.clone());
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        let h = blake3::hash(&bytes).to_hex().to_string();
+        self.hash_cache = Some((path, h.clone()));
+        Some(h)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Ok,
+    Warn,
+    Err,
+}
+
+#[derive(Debug)]
+pub enum Modal {
+    /// Popup d'information (fermer : Esc/Enter).
+    Info { title: String, lines: Vec<String> },
+    /// Confirmation O/N avant action destructive.
+    Confirm {
+        title: String,
+        lines: Vec<String>,
+        action: PendingAction,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    Shred(PathBuf),
+}
+
+pub struct App {
+    pub should_quit: bool,
+    pub screen: Screen,
+    pub boot: super::boot::Boot,
+    pub rain: Rain,
+    pub tab: Tab,
+    pub theme_idx: usize,
+    pub profile: SystemProfile,
+    pub mode: Mode,
+    pub boot_anim: bool,
+    pub argon2: crate::crypto::Argon2Params,
+    pub start: Instant,
+    pub tick: u64,
+    pub log: VecDeque<(String, Level, String)>,
+    pub modal: Option<Modal>,
+    pub help_open: bool,
+    pub panic: bool,
+    pub picker_vault: FilePicker,
+    pub picker_shred: FilePicker,
+    pub shred_passes: usize,
+    pub settings_sel: usize,
+    pub qr_input: String,
+    pub qr_edit: bool,
+    pub log_scroll: u16,
+    /// Fenêtre de transition glitch après boot/panic.
+    pub transition_end: Option<Instant>,
+    pub status_msg: Option<(String, Instant)>,
+}
+
+impl App {
+    pub fn new(cfg: &Config, no_anim: bool) -> Self {
+        let profile = crate::sys::probe();
+        let anim = cfg.boot_anim && !no_anim;
+        Self {
+            should_quit: false,
+            screen: if anim { Screen::Boot } else { Screen::Main },
+            boot: super::boot::Boot::new(&profile),
+            rain: Rain::new(120, 40),
+            tab: Tab::Dashboard,
+            theme_idx: theme::by_name(&cfg.theme),
+            profile,
+            mode: cfg.mode,
+            boot_anim: cfg.boot_anim,
+            argon2: cfg.argon2,
+            start: Instant::now(),
+            tick: 0,
+            log: VecDeque::with_capacity(256),
+            modal: None,
+            help_open: false,
+            panic: false,
+            picker_vault: FilePicker::new(),
+            picker_shred: FilePicker::new(),
+            shred_passes: 3,
+            settings_sel: 0,
+            qr_input: String::new(),
+            qr_edit: true,
+            log_scroll: 0,
+            transition_end: None,
+            status_msg: None,
+        }
+    }
+
+    pub fn theme(&self) -> &'static Theme {
+        &theme::THEMES[self.theme_idx % theme::THEMES.len()]
+    }
+
+    pub fn uptime(&self) -> String {
+        let s = self.start.elapsed().as_secs();
+        format!("T+{:02}:{:02}", s / 60, s % 60)
+    }
+
+    pub fn push_log(&mut self, level: Level, msg: impl Into<String>) {
+        let t = self.uptime();
+        if self.log.len() >= 512 {
+            self.log.pop_front();
+        }
+        self.log.push_back((t, level, msg.into()));
+    }
+
+    pub fn toast(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some((msg.into(), Instant::now()));
+    }
+
+    /// Score OPSEC 0-100 affiché au dashboard — heuristique v0.1.
+    pub fn opsec_score(&self) -> u16 {
+        let p = &self.profile;
+        let mut s = 0u16;
+        if p.rng_ok {
+            s += 30;
+        }
+        if p.memlock.ok() {
+            s += 25;
+        }
+        if p.cpu.hypervisor == Some(false) {
+            s += 20;
+        }
+        if p.tracer_detected == Some(false) {
+            s += 15;
+        }
+        if self.mode == Mode::Expert {
+            s += 10;
+        } else {
+            s += 5;
+        }
+        s.min(100)
+    }
+}
