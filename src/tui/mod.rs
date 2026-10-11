@@ -105,11 +105,8 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
         term.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => on_key_or_burst(app, k),
+                Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
                 Event::Resize(w, h) => app.rain.resize(w, h),
-                // Drag & drop : le terminal colle le chemin du fichier
-                // (bracketed paste — unix uniquement, voir drain_key_burst).
-                Event::Paste(text) => on_paste(app, &text),
                 Event::Mouse(m) => on_mouse(app, m),
                 _ => {}
             }
@@ -119,57 +116,6 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
             return Ok(());
         }
     }
-}
-
-/// Windows : le bracketed-paste n'existe pas (API console legacy) — un
-/// drop/collage arrive en **rafale de KeyEvents** (chemin « tapé » char
-/// par char). Si des events sont encore en attente derrière la touche,
-/// on draine la rafale : texte ressemblant à un chemin → `on_paste`,
-/// sinon on rejoue les Press dans l'ordre (les Release consommés sont
-/// ceux qu'on ignorait de toute façon). Retourne `true` si la rafale
-/// a été traitée ici.
-fn on_key_or_burst(app: &mut App, k: KeyEvent) {
-    if !drain_key_burst(app, k) {
-        on_key(app, k);
-    }
-}
-
-fn drain_key_burst(app: &mut App, first: KeyEvent) -> bool {
-    if !matches!(event::poll(Duration::from_millis(0)), Ok(true)) {
-        return false;
-    }
-    let mut keys = vec![first];
-    let mut chars = String::new();
-    let deadline = Instant::now() + Duration::from_millis(80);
-    while Instant::now() < deadline && matches!(event::poll(Duration::from_millis(2)), Ok(true)) {
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
-                match k.code {
-                    KeyCode::Char(c) => chars.push(c),
-                    KeyCode::Enter => chars.push('\n'),
-                    _ => {}
-                }
-                keys.push(k);
-            }
-            Ok(Event::Paste(t)) => chars.push_str(&t),
-            _ => {}
-        }
-    }
-    if let KeyCode::Char(c) = first.code {
-        chars = format!("{c}{chars}");
-    }
-    let text = chars.trim_end_matches(['\r', '\n']).to_string();
-    // Chemin droppé : contient un séparateur ou un drive `:`.
-    // Paste texte : plusieurs chars ou une ligne collée.
-    let looks_pasted = text.contains(['\\', '/', ':']) || text.len() >= 4 || chars.contains('\n');
-    if looks_pasted {
-        on_paste(app, &text);
-    } else {
-        for k in keys {
-            on_key(app, k);
-        }
-    }
-    true
 }
 
 fn on_tick(app: &mut App) {
@@ -281,110 +227,6 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
 }
 
-/// Drag & drop / paste d'un chemin de fichier :
-/// CRYPT → ajout à la file de cibles · SHRED → cible du picker ·
-/// KEYS (un .aos) → modale de déchiffrement par clé.
-fn on_paste(app: &mut App, text: &str) {
-    // Si une modale de saisie est ouverte → le texte collé va dans le champ.
-    if let Some(Modal::Input {
-        title,
-        mut fields,
-        sel,
-        strength_meter,
-        action,
-    }) = app.modal.take()
-    {
-        for c in text.chars() {
-            if !c.is_control() {
-                fields[sel].value.push(c);
-            }
-        }
-        app.modal = Some(Modal::Input {
-            title,
-            fields,
-            sel,
-            strength_meter,
-            action,
-        });
-        return;
-    }
-    let cleaned = app::clean_dropped_path(text);
-    if cleaned.is_empty() {
-        return;
-    }
-    let p = PathBuf::from(&cleaned);
-    match app.tab {
-        Tab::Crypt => {
-            if app.add_target(p.clone()) {
-                let n = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                app.push_log(Level::Ok, format!("dropped → {n}"));
-                app.toast(format!("target queued: {n} ({} total)", app.targets.len()));
-            } else {
-                app.toast(if p.exists() {
-                    "already queued"
-                } else {
-                    "dropped path not found"
-                });
-            }
-        }
-        Tab::Shred => {
-            if app.picker_shred.jump(&cleaned) {
-                let name = app
-                    .picker_shred
-                    .target
-                    .as_ref()
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| cleaned.clone());
-                app.push_log(Level::Ok, format!("dropped → {name}"));
-                app.toast(format!("target: {name}"));
-            } else {
-                app.toast("dropped path not found");
-                app.push_log(Level::Warn, format!("drop ignored: {cleaned}"));
-            }
-        }
-        Tab::Keys => {
-            if p.extension().and_then(|e| e.to_str()) == Some("aos") {
-                match crate::crypto::inspect(&p) {
-                    // conteneur destinataires → choix de la clé keyring.
-                    Ok(h) if h.is_recipient_mode() => {
-                        let default_key = app
-                            .keyring
-                            .get(app.keys_sel)
-                            .map(|(n, _, _)| n.clone())
-                            .unwrap_or_default();
-                        app.modal = Some(Modal::Input {
-                            title: format!("DECRYPT WITH KEY — {cleaned}"),
-                            fields: vec![Field::plain("key name").hint(format!(
-                                "selected: {default_key} · empty = try whole keyring"
-                            ))],
-                            sel: 0,
-                            strength_meter: false,
-                            action: PendingAction::DecryptKey(p),
-                        });
-                    }
-                    // mot de passe → modale passphrase normale.
-                    Ok(_) => {
-                        app.modal = Some(Modal::Input {
-                            title: format!("DECRYPT — {cleaned}"),
-                            fields: vec![Field::masked("passphrase")],
-                            sel: 0,
-                            strength_meter: false,
-                            action: PendingAction::Decrypt(p),
-                        });
-                    }
-                    Err(_) => app.toast("not an .aos container"),
-                }
-            } else {
-                app.toast("drop an .aos container here to decrypt it");
-            }
-        }
-        _ => app.toast("drop files onto CRYPT, SHRED or KEYS tabs"),
-    }
-}
-
 /// Clic souris / scroll — hit-testing sur les zones enregistrées au draw.
 fn on_mouse(app: &mut App, m: MouseEvent) {
     match m.kind {
@@ -404,7 +246,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                 }
                 HitAction::Target(i) => {
                     app.targets_sel = i;
-                    app.crypt_focus = CryptFocus::Targets;
+                    app.crypt_focus = CryptFocus::Browse;
                 }
                 HitAction::TargetRemove(i) => {
                     if i < app.targets.len() {
@@ -412,6 +254,13 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                         app.targets_sel = app.targets_sel.min(app.targets.len().saturating_sub(1));
                         app.push_log(Level::Info, format!("removed {}", rm.display()));
                     }
+                }
+                HitAction::Pick(i) => {
+                    app.crypt_focus = CryptFocus::Browse;
+                    crypt_activate(app, i);
+                }
+                HitAction::KeyRow(i) => {
+                    app.keys_sel = i.min(app.keyring.len().saturating_sub(1));
                 }
                 HitAction::OpEncrypt => open_encrypt_modal(app),
                 HitAction::OpDecrypt => {
@@ -441,8 +290,8 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         }
         MouseEventKind::ScrollUp => match app.tab {
             Tab::Crypt => {
-                if app.crypt_focus == CryptFocus::Targets {
-                    app.targets_sel = app.targets_sel.saturating_sub(1);
+                if app.crypt_focus == CryptFocus::Browse {
+                    app.picker_crypt.move_sel(-1);
                 } else {
                     app.opts_sel = app.opts_sel.saturating_sub(1);
                 }
@@ -454,10 +303,8 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         },
         MouseEventKind::ScrollDown => match app.tab {
             Tab::Crypt => {
-                if app.crypt_focus == CryptFocus::Targets {
-                    if !app.targets.is_empty() {
-                        app.targets_sel = (app.targets_sel + 1).min(app.targets.len() - 1);
-                    }
+                if app.crypt_focus == CryptFocus::Browse {
+                    app.picker_crypt.move_sel(1);
                 } else {
                     let n = app.opt_rows().len();
                     app.opts_sel = (app.opts_sel + 1).min(n.saturating_sub(1));
@@ -474,14 +321,46 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     }
 }
 
-/// Touches du picker SHRED — navigation (j)saut, (h)ome, backspace parent.
-/// Retourne vrai si la touche est consommée.
-fn picker_nav(app: &mut App, k: &KeyEvent) -> bool {
-    let picker = &mut app.picker_shred;
+/// Activation d'une ligne du navigateur CRYPT : dossier → descend,
+/// fichier → ajout à la file de cibles.
+fn crypt_activate(app: &mut App, i: usize) {
+    let Some(e) = app.picker_crypt.entries.get(i).cloned() else {
+        return;
+    };
+    if e.is_dir {
+        app.picker_crypt.dir = e.path;
+        app.picker_crypt.sel = 0;
+        app.picker_crypt.refresh();
+    } else {
+        app.picker_crypt.sel = i;
+        if app.add_target(e.path.clone()) {
+            app.toast(format!("queued: {} ({} total)", e.name, app.targets.len()));
+            app.push_log(Level::Ok, format!("target + {e}", e = e.name));
+        } else {
+            app.toast("already queued");
+        }
+    }
+}
+
+/// Touches communes des file pickers — navigation (j)saut, (h)ome,
+/// backspace parent. Retourne vrai si la touche est consommée.
+fn picker_nav(app: &mut App, k: &KeyEvent, shred: bool) -> bool {
+    let picker = if shred {
+        &mut app.picker_shred
+    } else {
+        &mut app.picker_crypt
+    };
     match k.code {
         KeyCode::Up => picker.move_sel(-1),
         KeyCode::Down => picker.move_sel(1),
-        KeyCode::Enter => picker.activate(),
+        KeyCode::Enter => {
+            if shred {
+                picker.activate()
+            } else {
+                let sel = picker.sel;
+                crypt_activate(app, sel);
+            }
+        }
         KeyCode::Backspace => {
             if let Some(par) = picker.dir.parent().map(|p| p.to_path_buf()) {
                 picker.dir = par;
@@ -498,7 +377,7 @@ fn picker_nav(app: &mut App, k: &KeyEvent) -> bool {
                 ],
                 sel: 0,
                 strength_meter: false,
-                action: PendingAction::JumpPath(true),
+                action: PendingAction::JumpPath(shred),
             });
         }
         _ => return false,
@@ -630,59 +509,59 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
             _ => {}
         },
         Tab::Crypt => match app.crypt_focus {
-            CryptFocus::Targets => match k.code {
-                KeyCode::Up => app.targets_sel = app.targets_sel.saturating_sub(1),
-                KeyCode::Down if !app.targets.is_empty() => {
-                    app.targets_sel = (app.targets_sel + 1).min(app.targets.len() - 1)
+            CryptFocus::Browse => {
+                if picker_nav(app, &k, false) {
+                    return;
                 }
-                KeyCode::Char('o') => app.crypt_focus = CryptFocus::Options,
-                KeyCode::Char('j') => {
-                    app.modal = Some(Modal::Input {
-                        title: "ADD TARGET PATH".into(),
-                        fields: vec![
-                            Field::plain("path").hint("absolute or relative path · file or folder"),
-                        ],
-                        sel: 0,
-                        strength_meter: false,
-                        action: PendingAction::JumpPath(false),
-                    });
-                }
-                KeyCode::Char('x') | KeyCode::Delete if !app.targets.is_empty() => {
-                    let i = app.targets_sel.min(app.targets.len() - 1);
-                    let rm = app.targets.remove(i);
-                    app.targets_sel = app.targets_sel.min(app.targets.len().saturating_sub(1));
-                    app.push_log(Level::Info, format!("removed {}", rm.display()));
-                }
-                KeyCode::Char('c') => {
-                    app.targets.clear();
-                    app.targets_sel = 0;
-                    app.push_log(Level::Info, "targets cleared");
-                }
-                KeyCode::Char('m') => crypt_toggle_mode(app),
-                KeyCode::Char('e') => open_encrypt_modal(app),
-                KeyCode::Char('d') => {
-                    if let Some(p) = app.targets.get(app.targets_sel).cloned() {
-                        open_decrypt_modal(app, &p);
-                    } else {
-                        app.toast("queue a target first");
+                match k.code {
+                    KeyCode::Char('o') => app.crypt_focus = CryptFocus::Options,
+                    KeyCode::Char('x') | KeyCode::Delete if !app.targets.is_empty() => {
+                        let i = app.targets_sel.min(app.targets.len() - 1);
+                        let rm = app.targets.remove(i);
+                        app.targets_sel = app.targets_sel.min(app.targets.len().saturating_sub(1));
+                        app.push_log(Level::Info, format!("removed {}", rm.display()));
                     }
-                }
-                KeyCode::Char('i') => {
-                    if let Some(p) = app.targets.get(app.targets_sel).cloned() {
-                        open_audit_modal(app, &p);
-                    } else {
-                        app.toast("queue a target first");
+                    KeyCode::Char('u') if !app.targets.is_empty() => {
+                        app.targets_sel = if app.targets_sel == 0 {
+                            app.targets.len() - 1
+                        } else {
+                            app.targets_sel - 1
+                        };
                     }
+                    KeyCode::Char('n') if !app.targets.is_empty() => {
+                        app.targets_sel = (app.targets_sel + 1) % app.targets.len();
+                    }
+                    KeyCode::Char('c') => {
+                        app.targets.clear();
+                        app.targets_sel = 0;
+                        app.push_log(Level::Info, "targets cleared");
+                    }
+                    KeyCode::Char('m') => crypt_toggle_mode(app),
+                    KeyCode::Char('e') => open_encrypt_modal(app),
+                    KeyCode::Char('d') => {
+                        if let Some(p) = app.targets.get(app.targets_sel).cloned() {
+                            open_decrypt_modal(app, &p);
+                        } else {
+                            app.toast("queue a target first");
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        if let Some(p) = app.targets.get(app.targets_sel).cloned() {
+                            open_audit_modal(app, &p);
+                        } else {
+                            app.toast("queue a target first");
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             CryptFocus::Options => match k.code {
                 KeyCode::Up => app.opts_sel = app.opts_sel.saturating_sub(1),
                 KeyCode::Down => {
                     let n = app.opt_rows().len();
                     app.opts_sel = (app.opts_sel + 1).min(n.saturating_sub(1))
                 }
-                KeyCode::Char('o') | KeyCode::Esc => app.crypt_focus = CryptFocus::Targets,
+                KeyCode::Char('o') | KeyCode::Esc => app.crypt_focus = CryptFocus::Browse,
                 KeyCode::Char(' ') | KeyCode::Enter => {
                     let row = app.opt_rows().get(app.opts_sel).copied();
                     if let Some(r) = row {
@@ -727,7 +606,7 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
             },
         },
         Tab::Shred => {
-            if picker_nav(app, &k) {
+            if picker_nav(app, &k, true) {
                 return;
             }
             match k.code {
@@ -778,6 +657,35 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
                         ],
                         action: PendingAction::DeleteKey(name),
                     });
+                }
+            }
+            KeyCode::Char('i') => {
+                app.modal = Some(Modal::Input {
+                    title: "IMPORT PUBLIC KEY".into(),
+                    fields: vec![
+                        Field::plain("name").hint("keyring name for this key"),
+                        Field::plain("source").hint("path to a .pub file OR raw hex"),
+                    ],
+                    sel: 0,
+                    strength_meter: false,
+                    action: PendingAction::ImportPub,
+                });
+            }
+            KeyCode::Char('o') => {
+                if let Some((name, _, has_sec)) = app.keyring.get(app.keys_sel).cloned() {
+                    if !has_sec {
+                        app.toast("public key only — no secret key to decrypt");
+                    } else {
+                        app.modal = Some(Modal::Input {
+                            title: format!("DECRYPT WITH '{name}'"),
+                            fields: vec![Field::plain("container").hint("path to a .aos file")],
+                            sel: 0,
+                            strength_meter: false,
+                            action: PendingAction::DecryptWithKey(name),
+                        });
+                    }
+                } else {
+                    app.toast("no key selected — [g] generate first");
                 }
             }
             KeyCode::Char('r') => {
@@ -1163,14 +1071,54 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
                 }
             } else {
                 let pb = PathBuf::from(app::clean_dropped_path(&p));
-                if app.add_target(pb.clone()) {
-                    app.toast(format!("target queued: {}", pb.display()));
-                } else if pb.exists() {
-                    app.toast("already queued");
+                if pb.is_dir() {
+                    app.picker_crypt.dir = pb;
+                    app.picker_crypt.sel = 0;
+                    app.picker_crypt.refresh();
+                    app.toast(format!("→ {}", app.picker_crypt.dir.display()));
+                } else if pb.is_file() {
+                    if app.add_target(pb.clone()) {
+                        app.toast(format!("target queued: {}", pb.display()));
+                    } else {
+                        app.toast("already queued");
+                    }
                 } else {
                     app.toast("path not found");
                 }
             }
+        }
+        PendingAction::DecryptWithKey(name) => {
+            let p = PathBuf::from(app::clean_dropped_path(&val(0)));
+            if p.extension().and_then(|e| e.to_str()) != Some("aos") || !p.is_file() {
+                app.toast("not an .aos file");
+                return;
+            }
+            let out = decrypt_out(&p);
+            spawn_worker(app, format!("DECRYPT '{name}'"), move |tx| {
+                let sec = crate::crypto::keys::load_secret(&name)?;
+                engine::decrypt_file(&p, &out, &Credential::SecretKey(sec), &mut |d| {
+                    let _ = tx.send(app::WorkerMsg::Progress(d));
+                })?;
+                Ok(format!("decrypted → {}", out.display()))
+            });
+        }
+        PendingAction::ImportPub => {
+            let (name, source) = (val(0), val(1));
+            if name.is_empty() || source.is_empty() {
+                app.toast("name + source required — aborted");
+                return;
+            }
+            match crate::crypto::keys::import_public(&name, &source) {
+                Ok((path, fp)) => {
+                    app.push_log(Level::Ok, format!("pub key '{name}' → {}", path.display()));
+                    app.toast(format!("imported '{name}' {fp}"));
+                }
+                Err(e) => {
+                    app.toast("import failed");
+                    app.push_log(Level::Err, format!("import pub '{name}': {e}"));
+                }
+            }
+            app.keyring = crate::crypto::keys::list().unwrap_or_default();
         }
     }
 }

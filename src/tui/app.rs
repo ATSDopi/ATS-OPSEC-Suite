@@ -329,6 +329,10 @@ pub enum PendingAction {
     Decrypt(PathBuf),
     /// fields: [key name or .sec path]
     DecryptKey(PathBuf),
+    /// fields: [.aos path] — clé secrète imposée par son nom.
+    DecryptWithKey(String),
+    /// fields: [name, source(.pub path or hex)]
+    ImportPub,
     /// fields: [name]
     Keygen,
     DeleteKey(String),
@@ -348,7 +352,8 @@ pub enum CryptMode {
 /// Ce qui a le focus clavier dans l'onglet CRYPT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptFocus {
-    Targets,
+    /// Colonne de gauche : navigateur de fichiers + file de cibles.
+    Browse,
     Options,
 }
 
@@ -370,6 +375,10 @@ pub enum HitAction {
     OptRow(OptRow),
     Target(usize),
     TargetRemove(usize),
+    /// Ligne du navigateur de fichiers (index dans `picker.entries`).
+    Pick(usize),
+    /// Ligne du keyring.
+    KeyRow(usize),
     OpEncrypt,
     OpDecrypt,
     OpAudit,
@@ -412,7 +421,9 @@ pub struct App {
     pub status_msg: Option<(String, Instant)>,
     /// Worker crypto/shred en arrière-plan (progression → modale).
     pub worker: Option<Worker>,
-    /// File de cibles CRYPT (fichiers/dossiers droppés — pack tar).
+    /// Navigateur de fichiers CRYPT (parcours dossiers → files dans targets).
+    pub picker_crypt: FilePicker,
+    /// File de cibles CRYPT (multi-fichiers/dossiers — pack tar).
     pub targets: Vec<PathBuf>,
     pub targets_sel: usize,
     /// Couches AEAD ordonnées — 1 seule = mode simple, >1 = cascade.
@@ -462,6 +473,7 @@ impl App {
             transition_end: None,
             status_msg: None,
             worker: None,
+            picker_crypt: FilePicker::new(),
             targets: Vec::new(),
             targets_sel: 0,
             crypt_ciphers: vec![crate::crypto::CipherKind::XChaCha20],
@@ -469,7 +481,7 @@ impl App {
             crypt_pad: false,
             crypt_shred_orig: false,
             crypt_mode: CryptMode::Password,
-            crypt_focus: CryptFocus::Targets,
+            crypt_focus: CryptFocus::Browse,
             opts_sel: 0,
             hit: Vec::new(),
             ops_done: 0,

@@ -266,34 +266,68 @@ fn crypt(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
 
-    // -- LEFT : file de cibles (drop zone) -----------------------------------
-    let focused_t = app.crypt_focus == CryptFocus::Targets;
-    let mut tblock = panel("TARGETS — drop files/folders", theme);
-    if focused_t {
-        tblock = tblock.border_style(Style::default().fg(theme.accent));
+    // -- LEFT : navigateur fichiers + file de cibles --------------------------
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(9)])
+        .split(cols[0]);
+    let focused_t = app.crypt_focus == CryptFocus::Browse;
+    draw_picker(
+        f,
+        left[0],
+        &app.picker_crypt,
+        focused_t,
+        "BROWSE — enter=queue · click=open",
+        theme,
+    );
+    // Zones clics du navigateur (même offset que draw_picker).
+    {
+        let binner = Rect {
+            x: left[0].x + 1,
+            y: left[0].y + 1,
+            width: left[0].width.saturating_sub(2),
+            height: left[0].height.saturating_sub(2),
+        };
+        let inner_h = binner.height as usize;
+        let skip = app
+            .picker_crypt
+            .sel
+            .saturating_sub(inner_h.saturating_sub(1));
+        let n = app
+            .picker_crypt
+            .entries
+            .len()
+            .saturating_sub(skip)
+            .min(inner_h);
+        for row_i in 0..n {
+            app.reg_hit(
+                Rect {
+                    x: binner.x,
+                    y: binner.y + row_i as u16,
+                    width: binner.width,
+                    height: 1,
+                },
+                HitAction::Pick(skip + row_i),
+            );
+        }
     }
-    let tinner = tblock.inner(cols[0]);
-    tblock.render(cols[0], f.buffer_mut());
+
+    let mut tblock = panel("TARGETS — queued for encrypt", theme);
+    if focused_t && !app.targets.is_empty() {
+        tblock = tblock.border_style(Style::default().fg(theme.accent2));
+    }
+    let tinner = tblock.inner(left[1]);
+    tblock.render(left[1], f.buffer_mut());
 
     let visible = tinner.height.saturating_sub(1) as usize;
-    let items: Vec<Line> = if app.targets.is_empty() {
+    let mut lines: Vec<Line> = if app.targets.is_empty() {
         vec![
-            Line::from(""),
             Line::from(Span::styled(
-                "  drag & drop files or folders here",
-                Style::default().fg(theme.accent),
-            )),
-            Line::from(Span::styled(
-                "  or press [j] to type a path",
-                Style::default().fg(theme.dim),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  · multiple inputs → single .aos (tar-packed)",
+                "  empty — browse & [enter] files, or [j] a path",
                 Style::default().fg(theme.dim),
             )),
             Line::from(Span::styled(
-                "  · a dropped folder encrypts recursively",
+                "  multi inputs → single .aos (tar-packed)",
                 Style::default().fg(theme.dim),
             )),
         ]
@@ -315,12 +349,12 @@ fn crypt(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                         human_size(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)),
                     )
                 };
-                let sel = focused_t && i == app.targets_sel;
+                let sel = i == app.targets_sel;
                 let c = if sel { theme.accent } else { theme.fg };
                 Line::from(vec![
                     Span::styled(if sel { "▶" } else { icon }, Style::default().fg(c)),
-                    Span::styled(format!(" {name:<30}"), Style::default().fg(c)),
-                    Span::styled(format!("{info:>10}"), Style::default().fg(theme.dim)),
+                    Span::styled(format!(" {name:<28}"), Style::default().fg(c)),
+                    Span::styled(format!("{info:>9}"), Style::default().fg(theme.dim)),
                     Span::styled(" [x]", Style::default().fg(theme.err)),
                 ])
             })
@@ -332,14 +366,12 @@ fn crypt(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         .filter(|p| p.is_file())
         .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .sum();
-    let mut lines = items;
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         if app.targets.is_empty() {
-            "  queue is empty".to_string()
+            "  [u/n] pick · [x] remove · [c] clear".to_string()
         } else {
             format!(
-                "  {} item(s) · {} queued",
+                "  {} item(s) · {} · [u/n][x][c]",
                 app.targets.len(),
                 human_size(total)
             )
@@ -538,8 +570,15 @@ fn crypt(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     Paragraph::new(drawn).render(oinner, f.buffer_mut());
 }
 
-fn draw_picker(f: &mut Frame, area: Rect, picker: &FilePicker, focused: bool, theme: &Theme) {
-    let title = format!(" {} ", picker.dir.display());
+fn draw_picker(
+    f: &mut Frame,
+    area: Rect,
+    picker: &FilePicker,
+    focused: bool,
+    label: &str,
+    theme: &Theme,
+) {
+    let title = format!(" {} · {} ", label, picker.dir.display());
     let mut block = panel("FILES", theme).title(title);
     if focused {
         block = block.border_style(Style::default().fg(theme.accent));
@@ -663,7 +702,14 @@ fn shred(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(area);
-    draw_picker(f, cols[0], &app.picker_shred, app.tab == Tab::Shred, theme);
+    draw_picker(
+        f,
+        cols[0],
+        &app.picker_shred,
+        app.tab == Tab::Shred,
+        "enter=target · [j] path",
+        theme,
+    );
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -731,7 +777,7 @@ fn shred(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 // ---------------------------------------------------------------- keys
 
-fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn keys(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -770,6 +816,8 @@ fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 ])
             })
             .collect();
+        let tblock = panel("KEYRING — xwing (x25519+ml-kem-768)", theme);
+        let tinner = tblock.inner(cols[0]);
         Table::new(
             rows,
             [
@@ -779,8 +827,19 @@ fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 Constraint::Percentage(26),
             ],
         )
-        .block(panel("KEYRING — xwing (x25519+ml-kem-768)", theme))
+        .block(tblock)
         .render(cols[0], f.buffer_mut());
+        for i in 0..app.keyring.len().min(tinner.height as usize) {
+            app.reg_hit(
+                Rect {
+                    x: tinner.x,
+                    y: tinner.y + i as u16,
+                    width: tinner.width,
+                    height: 1,
+                },
+                HitAction::KeyRow(i),
+            );
+        }
     }
 
     let rows_r = Layout::default()
@@ -822,9 +881,10 @@ fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let ops = [
         ("[g]", "generate xwing keypair"),
         ("[x]", "export public key (hex)"),
+        ("[i]", "import public key (.pub/hex)"),
+        ("[o]", "decrypt .aos with selected key"),
         ("[d]", "delete selected pair"),
         ("[r]", "refresh keyring"),
-        ("drop", ".aos file here → decrypt with key"),
     ];
     let mut items: Vec<ListItem> = ops
         .iter()

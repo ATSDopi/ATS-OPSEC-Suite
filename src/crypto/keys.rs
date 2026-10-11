@@ -144,6 +144,44 @@ pub fn list() -> Result<Vec<(String, String, bool)>> {
     Ok(out)
 }
 
+/// Enregistre une clé publique externe dans le keyring — pour chiffrer
+/// vers quelqu'un sans avoir sa clé secrète.
+/// `source` : chemin d'un fichier `.pub` OU hex brut de la clé X-Wing.
+/// Retourne (chemin du .pub créé, fingerprint).
+pub fn import_public(name: &str, source: &str) -> Result<(PathBuf, String)> {
+    validate_name(name)?;
+    let source = source.trim().trim_matches('"').trim_matches('\'');
+    let pubk = if Path::new(source).exists() {
+        load_public(source)?
+    } else {
+        let raw = hex::decode(source)
+            .map_err(|_| OpsecError::InvalidParam("ni fichier .pub ni hex valide".into()))?;
+        XwingPublic::from_bytes(&raw)?
+    };
+    let fp = pubk.fingerprint();
+    let dir = keys_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pubf = PubKeyFile {
+        name: name.to_string(),
+        kind: "xwing".into(),
+        key_hex: hex::encode(pubk.to_bytes()),
+        fingerprint: fp.clone(),
+        created,
+    };
+    let pub_path = dir.join(format!("{name}.pub"));
+    if pub_path.with_extension("sec").exists() {
+        return Err(OpsecError::InvalidParam(
+            "une paire locale existe déjà sous ce nom".into(),
+        ));
+    }
+    std::fs::write(&pub_path, serde_json::to_string_pretty(&pubf).unwrap())?;
+    Ok((pub_path, fp))
+}
+
 /// Supprime une paire du keyring.
 pub fn delete(name: &str) -> Result<()> {
     let dir = keys_dir()?;
