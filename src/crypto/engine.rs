@@ -15,14 +15,14 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce as GcmNonce};
+use aes_gcm::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
+use super::ciphers::CipherKind;
 use super::format::{self, AosHeader, RecipientSlot};
 use super::kdf::{self, KEY_LEN};
-use super::{Argon2Params, CipherSuite, DEFAULT_CHUNK_SIZE, kem};
+use super::{Argon2Params, DEFAULT_CHUNK_SIZE, kem, pack};
 use crate::error::{OpsecError, Result};
 
 const TAG_LEN: usize = 16;
@@ -33,20 +33,24 @@ const PAD_BLOCK: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EncryptOptions {
-    pub suite: CipherSuite,
+    /// Couches AEAD ordonnées (interne → externe). >1 = cascade.
+    pub ciphers: Vec<CipherKind>,
     pub argon2: Argon2Params,
     pub compress: bool,
     pub pad: bool,
+    /// Le contenu clair est une archive tar (multi-fichiers) — interne.
+    pub packed: bool,
     pub chunk_size: u32,
 }
 
 impl Default for EncryptOptions {
     fn default() -> Self {
         Self {
-            suite: CipherSuite::XChaCha20,
+            ciphers: vec![CipherKind::XChaCha20],
             argon2: Argon2Params::default(),
             compress: false,
             pad: false,
+            packed: false,
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
@@ -85,9 +89,10 @@ pub fn encrypt_stream<R: Read, W: Write>(
 ) -> Result<AosHeader> {
     let mut dst = CountWriter::new(dst);
     let nonce_prefix: [u8; 16] = kdf::random_bytes()?;
-    let mut header = AosHeader::new(opts.suite, opts.chunk_size, nonce_prefix);
+    let mut header = AosHeader::new(&opts.ciphers, opts.chunk_size, nonce_prefix);
     header.compressed = opts.compress;
     header.padded = opts.pad;
+    header.packed = opts.packed;
 
     // Clé maître selon le mode.
     let master: Zeroizing<[u8; KEY_LEN]> = match key {
@@ -114,7 +119,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     let aad = blake3::hash(&raw);
     let aad: &[u8] = aad.as_bytes();
 
-    let layers = Layers::new(opts.suite, &master, &nonce_prefix);
+    let layers = Layers::new(&opts.ciphers, &master, &nonce_prefix)?;
 
     // Compression en amont du chiffrement (stream).
     let mut reader: Box<dyn Read> = if opts.compress {
@@ -206,7 +211,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
         }
     };
 
-    let layers = Layers::new(header.suite, &master, &nonce_prefix);
+    let layers = Layers::new(&header.cipher_kinds()?, &master, &nonce_prefix)?;
 
     // Décompression côté écriture si le container est compressé.
     let mut writer: Box<dyn Write + '_> = if header.compressed {
@@ -231,8 +236,8 @@ pub fn decrypt_stream<R: Read, W: Write>(
         let word = u32::from_le_bytes(fl);
         let last = word & LAST_BIT != 0;
         let ct_len = (word & !LAST_BIT) as usize;
-        // cascade = 2 tags + marge ; single = 1 tag
-        let max_ct = header.chunk_size as usize + TAG_LEN * 2 + 8;
+        // chaque couche ajoute son tag 16o (+ marge)
+        let max_ct = header.chunk_size as usize + TAG_LEN * layers.len() + 8;
         if ct_len < TAG_LEN || ct_len > max_ct {
             return Err(OpsecError::Header(format!(
                 "chunk {counter} : longueur invalide ({ct_len})"
@@ -276,13 +281,64 @@ pub fn encrypt_file(
     Ok(output.to_path_buf())
 }
 
+/// Chiffre plusieurs entrées (fichiers/dossiers) → un seul `.aos` contenant
+/// une archive tar streamée via pipe (header `packed=true`, rien de temporaire
+/// en clair sur disque).
+pub fn encrypt_paths(
+    inputs: &[PathBuf],
+    output: &Path,
+    key: &KeySource,
+    opts: &EncryptOptions,
+    progress: &mut dyn FnMut(u64),
+) -> Result<PathBuf> {
+    if inputs.is_empty() {
+        return Err(OpsecError::InvalidParam("aucune entrée".into()));
+    }
+    // Cas trivial : un seul fichier régulier → stream direct.
+    if inputs.len() == 1 && inputs[0].is_file() {
+        let mut o = opts.clone();
+        o.packed = false;
+        return encrypt_file(&inputs[0], output, key, &o, progress);
+    }
+    for i in inputs {
+        if !i.exists() {
+            return Err(OpsecError::InvalidParam(format!(
+                "entrée introuvable: {}",
+                i.display()
+            )));
+        }
+    }
+    let mut o = opts.clone();
+    o.packed = true;
+    let (reader, writer) = pack::pipe()?;
+    let owned = inputs.to_vec();
+    let tar_thread = pack::spawn(move || pack::write_tar(&owned, writer));
+    let tmp = tmp_name(output, "aos.tmp");
+    {
+        let dst = BufWriter::new(File::create(&tmp)?);
+        encrypt_stream(reader, dst, key, &o, progress).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
+    }
+    tar_thread
+        .join()
+        .map_err(|_| OpsecError::Crypto("tar thread panic".into()))??;
+    fs::rename(&tmp, output)?;
+    Ok(output.to_path_buf())
+}
+
 /// Déchiffre un `.aos` → sortie via tmp + rename (vérifier avant d'écrire).
+/// Container `packed` : `output` est traité comme un DOSSIER — extraction
+/// dans `<output>.tmp` puis rename atomique (aucun artefact partiel).
 pub fn decrypt_file(
     input: &Path,
     output: &Path,
     cred: &Credential,
     progress: &mut dyn FnMut(u64),
 ) -> Result<PathBuf> {
+    if inspect(input).map(|h| h.packed).unwrap_or(false) {
+        return decrypt_packed(input, output, cred, progress);
+    }
     let src = File::open(input)?;
     let tmp = tmp_name(output, "dec.tmp");
     {
@@ -292,6 +348,37 @@ pub fn decrypt_file(
         })?;
     }
     fs::rename(&tmp, output)?;
+    Ok(output.to_path_buf())
+}
+
+/// Déchiffre un container packed (tar) → dossier `output`.
+fn decrypt_packed(
+    input: &Path,
+    output: &Path,
+    cred: &Credential,
+    progress: &mut dyn FnMut(u64),
+) -> Result<PathBuf> {
+    let (reader, writer) = pack::pipe()?;
+    let tmp_dir = tmp_name(output, "unp.tmp");
+    let dest = tmp_dir.clone();
+    let tar_thread = pack::spawn(move || pack::read_tar(reader, &dest));
+    let src = File::open(input)?;
+    decrypt_stream(src, writer, cred, progress).inspect_err(|_| {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    })?;
+    tar_thread
+        .join()
+        .map_err(|_| OpsecError::Crypto("untar thread panic".into()))?
+        .inspect_err(|_| {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        })?;
+    if output.exists() {
+        return Err(OpsecError::InvalidParam(format!(
+            "destination existe: {}",
+            output.display()
+        )));
+    }
+    fs::rename(&tmp_dir, output)?;
     Ok(output.to_path_buf())
 }
 
@@ -342,102 +429,75 @@ impl<W: Write> Write for CountWriter<W> {
     }
 }
 
-/// Couche(s) AEAD selon la suite choisie.
-trait AeadBox {
-    /// 24 (XChaCha20) ou 12 (AES-GCM).
-    fn nonce_len(&self) -> usize;
-    fn seal(&self, nonce: &[u8], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
-    fn open(&self, nonce: &[u8], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
-}
-
-struct XChaCha(XChaCha20Poly1305);
-struct AesGcm(Aes256Gcm);
-
-impl AeadBox for XChaCha {
-    fn nonce_len(&self) -> usize {
-        24
-    }
-    fn seal(&self, nonce: &[u8], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        self.0
-            .encrypt(XNonce::from_slice(nonce), Payload { msg: pt, aad })
-            .map_err(|_| OpsecError::Crypto("xchacha20 encrypt".into()))
-    }
-    fn open(&self, nonce: &[u8], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        self.0
-            .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
-            .map_err(|_| OpsecError::Auth)
-    }
-}
-
-impl AeadBox for AesGcm {
-    fn nonce_len(&self) -> usize {
-        12
-    }
-    fn seal(&self, nonce: &[u8], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        self.0
-            .encrypt(GcmNonce::from_slice(nonce), Payload { msg: pt, aad })
-            .map_err(|_| OpsecError::Crypto("aes-gcm encrypt".into()))
-    }
-    fn open(&self, nonce: &[u8], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        self.0
-            .decrypt(GcmNonce::from_slice(nonce), Payload { msg: ct, aad })
-            .map_err(|_| OpsecError::Auth)
-    }
-}
-
-enum Layers {
-    Single(Box<dyn AeadBox>),
-    /// inner = XChaCha20-Poly1305, outer = AES-256-GCM.
-    Cascade(Box<dyn AeadBox>, Box<dyn AeadBox>),
-}
+/// Pile de couches AEAD — l'ordre du `Vec` est l'ordre de scellement.
+struct Layers(Vec<super::ciphers::LayerImpl>);
 
 impl Layers {
-    fn new(suite: CipherSuite, master: &[u8; KEY_LEN], prefix: &[u8; 16]) -> Self {
-        let kx = kdf::expand(master, prefix, "aos/layer/xchacha20");
-        let ka = kdf::expand(master, prefix, "aos/layer/aes256gcm");
-        match suite {
-            CipherSuite::XChaCha20 => {
-                Layers::Single(Box::new(XChaCha(XChaCha20Poly1305::new((&*kx).into()))))
-            }
-            CipherSuite::Aes256Gcm => {
-                Layers::Single(Box::new(AesGcm(Aes256Gcm::new((&*ka).into()))))
-            }
-            CipherSuite::Cascade => Layers::Cascade(
-                Box::new(XChaCha(XChaCha20Poly1305::new((&*kx).into()))),
-                Box::new(AesGcm(Aes256Gcm::new((&*ka).into()))),
-            ),
+    fn new(
+        kinds: &[CipherKind],
+        master: &Zeroizing<[u8; KEY_LEN]>,
+        prefix: &[u8; 16],
+    ) -> Result<Self> {
+        if kinds.is_empty() {
+            return Err(OpsecError::InvalidParam("aucun cipher sélectionné".into()));
         }
+        Ok(Self(
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(i, k)| k.make_layer(master, prefix, i))
+                .collect(),
+        ))
     }
 
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Scelle : couche 0 sur le clair, couche n-1 la plus externe.
     fn seal(&self, counter: u64, pt: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        match self {
-            Layers::Single(l) => {
-                l.seal(&nonce_of(counter, l.nonce_len())[..l.nonce_len()], pt, aad)
-            }
-            Layers::Cascade(inner, outer) => {
-                let ct1 = inner.seal(&nonce_of(counter, 24)[..inner.nonce_len()], pt, aad)?;
-                outer.seal(&nonce_of(counter, 24)[..outer.nonce_len()], &ct1, aad)
-            }
+        let mut ct = pt.to_vec();
+        for l in &self.0 {
+            let kind_nonce_len = l_nonce_len(l);
+            ct = l.seal(
+                &nonce_of(counter, kind_nonce_len)[..kind_nonce_len],
+                &ct,
+                aad,
+            )?;
         }
+        Ok(ct)
     }
 
+    /// Ouvre : couche externe d'abord, interne en dernier.
     fn open(&self, counter: u64, ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        match self {
-            Layers::Single(l) => {
-                l.open(&nonce_of(counter, l.nonce_len())[..l.nonce_len()], ct, aad)
-            }
-            Layers::Cascade(inner, outer) => {
-                let ct1 = outer.open(&nonce_of(counter, 24)[..outer.nonce_len()], ct, aad)?;
-                inner.open(&nonce_of(counter, 24)[..inner.nonce_len()], &ct1, aad)
-            }
+        let mut pt = ct.to_vec();
+        for l in self.0.iter().rev() {
+            let kind_nonce_len = l_nonce_len(l);
+            pt = l.open(
+                &nonce_of(counter, kind_nonce_len)[..kind_nonce_len],
+                &pt,
+                aad,
+            )?;
         }
+        Ok(pt)
+    }
+}
+
+/// Taille de nonce d'une couche instanciée (pour le découpage compteur).
+fn l_nonce_len(l: &super::ciphers::LayerImpl) -> usize {
+    use super::ciphers::LayerImpl as L;
+    match l {
+        L::XChaCha(_) => 24,
+        L::Aes256Gcm(_) | L::Aes128Gcm(_) | L::GcmSiv(_) => 12,
+        L::Eax(_) | L::Ascon(_) => 16,
+        L::Deoxys(_) => 15,
+        L::Aegis(_) => 32,
     }
 }
 
 /// Nonce pour la couche : compteur u64 BE dans les 8 derniers octets,
-/// zéros avant, tronqué à `len` (12 AES-GCM / 24 XChaCha).
-/// Unicité garantie : la clé de couche est HKDF-saltée au nonce_prefix
-/// aléatoire de l'en-tête → (clé, nonce) jamais réutilisée.
+/// zéros avant, tronqué à `len`. Unicité garantie : chaque clé de couche
+/// est HKDF-saltée au nonce_prefix aléatoire → (clé, nonce) jamais réutilisée.
 fn nonce_of(counter: u64, len: usize) -> Vec<u8> {
     let mut n = vec![0u8; len];
     n[len - 8..].copy_from_slice(&counter.to_be_bytes());

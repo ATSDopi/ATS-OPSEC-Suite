@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs, Widget};
 
-use super::app::{App, Modal, Screen, Tab};
+use super::app::{App, HitAction, Modal, Screen, Tab};
 use super::boot;
 use super::screens;
 use super::theme::Theme;
@@ -49,6 +49,8 @@ fn draw_main(f: &mut Frame, app: &mut App, theme: &Theme) {
         ])
         .split(area);
 
+    // Zones cliquables reconstruites à chaque frame.
+    app.hit.clear();
     draw_header(f, chunks[0], app, theme);
     screens::draw(f, chunks[1], app, theme);
     draw_statusbar(f, chunks[2], app, theme);
@@ -73,7 +75,7 @@ fn draw_main(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn draw_header(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let parts = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -116,6 +118,24 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )
         .render(parts[1], f.buffer_mut());
+
+    // Zones clics des onglets (texte "N TITLE" + padding " " chaque côté).
+    {
+        let mut x = parts[1].x + 1;
+        for (i, t) in Tab::ALL.iter().enumerate() {
+            let w = 2 + 2 + t.title().len() as u16; // padding+digit+title
+            app.reg_hit(
+                Rect {
+                    x,
+                    y: area.y + 1,
+                    width: w,
+                    height: 1,
+                },
+                HitAction::Tab(i),
+            );
+            x += w + 1; // + séparateur "│"
+        }
+    }
 
     let ver = Paragraph::new(format!("v{}", env!("CARGO_PKG_VERSION")))
         .alignment(Alignment::Right)
@@ -408,18 +428,25 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ("  t", "cycle theme"),
         ("  p", "panic screen"),
         ("  q / ctrl+c", "quit"),
-        ("file pickers", ""),
-        ("  drag&drop", "drop a file on the window to select it"),
-        ("  ↑ ↓ / enter", "navigate / open dir / select file"),
-        ("  j h backspace", "jump to path · home · parent dir"),
-        ("crypt", ""),
+        ("mouse", ""),
+        ("  click", "tabs · toggles · ops buttons · targets"),
+        ("  wheel", "scroll lists"),
+        ("  right-click", "remove a target in CRYPT"),
+        ("crypt — targets", ""),
+        ("  drag&drop", "queue files/folders (multi → packed)"),
+        ("  j x c", "add path · remove sel · clear"),
         ("  e d i", "encrypt · decrypt · audit header"),
-        ("  m c", "auth mode · cipher suite"),
-        ("  z g o", "compress · pad-size · shred-orig"),
+        ("  o", "jump to OPTIONS"),
+        ("crypt — options", ""),
+        ("  space/enter", "toggle selected row"),
+        ("  ← →", "reorder checked ciphers (cascade)"),
+        ("  1-8", "quick toggle cipher layer"),
+        ("  m", "auth: passphrase ↔ recipient keys"),
         ("shred", ""),
         ("  s / [ ]", "shred target / passes"),
         ("keys", ""),
         ("  g x d r", "gen · export pub · delete · refresh"),
+        ("  drag&drop", "drop an .aos → decrypt with key"),
         ("dash", ""),
         ("  x a w", "expert · argon2 preset · save cfg"),
         ("modals", ""),

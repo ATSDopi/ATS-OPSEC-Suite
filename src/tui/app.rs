@@ -214,20 +214,6 @@ impl FilePicker {
             self.hash_cache = None;
         }
     }
-
-    /// Hash blake3 du target (calcul paresseux, mis en cache).
-    pub fn target_hash(&mut self) -> Option<String> {
-        let path = self.target.as_ref()?.path.clone();
-        if let Some((p, h)) = &self.hash_cache
-            && *p == path
-        {
-            return Some(h.clone());
-        }
-        let bytes = std::fs::read(&path).ok()?;
-        let h = blake3::hash(&bytes).to_hex().to_string();
-        self.hash_cache = Some((path, h.clone()));
-        Some(h)
-    }
 }
 
 /// Nettoie un chemin venant d'un drag & drop / paste terminal :
@@ -336,9 +322,9 @@ impl Field {
 pub enum PendingAction {
     Shred(PathBuf),
     /// fields: [password, confirm]
-    Encrypt(PathBuf),
+    Encrypt(Vec<PathBuf>),
     /// fields: [recipients, comma-sep names]
-    EncryptTo(PathBuf),
+    EncryptTo(Vec<PathBuf>),
     /// fields: [password]
     Decrypt(PathBuf),
     /// fields: [key name or .sec path]
@@ -346,7 +332,7 @@ pub enum PendingAction {
     /// fields: [name]
     Keygen,
     DeleteKey(String),
-    /// fields: [path] — true = picker shred, false = picker crypt.
+    /// fields: [path] — true = picker shred, false = target crypt.
     JumpPath(bool),
 }
 
@@ -357,6 +343,36 @@ pub enum CryptMode {
     Password,
     /// Clés publiques X-Wing de destinataires → partage sans mot de passe.
     Recipients,
+}
+
+/// Ce qui a le focus clavier dans l'onglet CRYPT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptFocus {
+    Targets,
+    Options,
+}
+
+/// Lignes cliquables du panneau OPTIONS (ordre = affichage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptRow {
+    AuthPassword,
+    AuthRecipients,
+    Cipher(usize),
+    Compress,
+    Pad,
+    ShredOrig,
+}
+
+/// Action déclenchée par un clic souris sur une zone enregistrée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitAction {
+    Tab(usize),
+    OptRow(OptRow),
+    Target(usize),
+    TargetRemove(usize),
+    OpEncrypt,
+    OpDecrypt,
+    OpAudit,
 }
 
 /// Message d'un thread worker vers la UI.
@@ -388,7 +404,6 @@ pub struct App {
     pub modal: Option<Modal>,
     pub help_open: bool,
     pub panic: bool,
-    pub picker_vault: FilePicker,
     pub picker_shred: FilePicker,
     pub shred_passes: usize,
     pub log_scroll: u16,
@@ -397,13 +412,22 @@ pub struct App {
     pub status_msg: Option<(String, Instant)>,
     /// Worker crypto/shred en arrière-plan (progression → modale).
     pub worker: Option<Worker>,
-    /// Options du vault (toggles).
-    pub vault_suite: crate::crypto::CipherSuite,
-    pub vault_compress: bool,
-    pub vault_pad: bool,
-    pub vault_shred_orig: bool,
+    /// File de cibles CRYPT (fichiers/dossiers droppés — pack tar).
+    pub targets: Vec<PathBuf>,
+    pub targets_sel: usize,
+    /// Couches AEAD ordonnées — 1 seule = mode simple, >1 = cascade.
+    pub crypt_ciphers: Vec<crate::crypto::CipherKind>,
+    /// Flags de l'onglet CRYPT.
+    pub crypt_compress: bool,
+    pub crypt_pad: bool,
+    pub crypt_shred_orig: bool,
     /// Mode d'authentification de l'onglet CRYPT.
     pub crypt_mode: CryptMode,
+    /// Focus clavier targets/options + curseur des options.
+    pub crypt_focus: CryptFocus,
+    pub opts_sel: usize,
+    /// Zones cliquables enregistrées à chaque draw (mouse hit-testing).
+    pub hit: Vec<(ratatui::layout::Rect, HitAction)>,
     /// Opérations réussies cette session (compteur dashboard).
     pub ops_done: u32,
     /// Keyring (nom, fingerprint, a_secret).
@@ -432,18 +456,22 @@ impl App {
             modal: None,
             help_open: false,
             panic: false,
-            picker_vault: FilePicker::new(),
             picker_shred: FilePicker::new(),
             shred_passes: 3,
             log_scroll: 0,
             transition_end: None,
             status_msg: None,
             worker: None,
-            vault_suite: crate::crypto::CipherSuite::XChaCha20,
-            vault_compress: false,
-            vault_pad: false,
-            vault_shred_orig: false,
+            targets: Vec::new(),
+            targets_sel: 0,
+            crypt_ciphers: vec![crate::crypto::CipherKind::XChaCha20],
+            crypt_compress: false,
+            crypt_pad: false,
+            crypt_shred_orig: false,
             crypt_mode: CryptMode::Password,
+            crypt_focus: CryptFocus::Targets,
+            opts_sel: 0,
+            hit: Vec::new(),
             ops_done: 0,
             keyring: crate::crypto::keys::list().unwrap_or_default(),
             keys_sel: 0,
@@ -469,6 +497,81 @@ impl App {
 
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.status_msg = Some((msg.into(), Instant::now()));
+    }
+
+    // ------------------------------------------------------------ crypt
+
+    /// Lignes du panneau OPTIONS dans l'ordre d'affichage.
+    pub fn opt_rows(&self) -> Vec<OptRow> {
+        let mut v = vec![OptRow::AuthPassword, OptRow::AuthRecipients];
+        for i in 0..crate::crypto::CipherKind::ALL.len() {
+            v.push(OptRow::Cipher(i));
+        }
+        v.extend([OptRow::Compress, OptRow::Pad, OptRow::ShredOrig]);
+        v
+    }
+
+    /// Ajoute une cible (fichier/dossier) à la file CRYPT. Dédupliqué.
+    /// `true` si ajouté.
+    pub fn add_target(&mut self, p: PathBuf) -> bool {
+        if !p.exists() || self.targets.contains(&p) {
+            return false;
+        }
+        self.targets.push(p);
+        self.targets_sel = self.targets.len() - 1;
+        true
+    }
+
+    /// Inverse membership d'un cipher dans la cascade (ordre = selection).
+    /// Garantit ≥ 1 couche.
+    pub fn toggle_cipher(&mut self, kind: crate::crypto::CipherKind) {
+        if let Some(i) = self.crypt_ciphers.iter().position(|k| *k == kind) {
+            if self.crypt_ciphers.len() > 1 {
+                self.crypt_ciphers.remove(i);
+            }
+        } else {
+            self.crypt_ciphers.push(kind);
+        }
+    }
+
+    /// Déplace un cipher sélectionné dans l'ordre de la cascade (delta ±1).
+    pub fn move_cipher(&mut self, kind: crate::crypto::CipherKind, delta: isize) {
+        if let Some(i) = self.crypt_ciphers.iter().position(|k| *k == kind) {
+            let n = self.crypt_ciphers.len() as isize;
+            let j = (i as isize + delta).rem_euclid(n) as usize;
+            self.crypt_ciphers.remove(i);
+            self.crypt_ciphers.insert(j, kind);
+        }
+    }
+
+    /// Toggle d'une ligne d'options (clic souris ou Espace).
+    pub fn toggle_opt_row(&mut self, row: OptRow) {
+        match row {
+            OptRow::AuthPassword => self.crypt_mode = CryptMode::Password,
+            OptRow::AuthRecipients => self.crypt_mode = CryptMode::Recipients,
+            OptRow::Cipher(i) => {
+                if let Some(k) = crate::crypto::CipherKind::ALL.get(i) {
+                    self.toggle_cipher(*k);
+                }
+            }
+            OptRow::Compress => self.crypt_compress = !self.crypt_compress,
+            OptRow::Pad => self.crypt_pad = !self.crypt_pad,
+            OptRow::ShredOrig => self.crypt_shred_orig = !self.crypt_shred_orig,
+        }
+    }
+
+    /// Zone cliquable sous `(x, y)` — parcours en sens inverse (dernier dessiné).
+    pub fn hit_at(&self, x: u16, y: u16) -> Option<HitAction> {
+        self.hit
+            .iter()
+            .rev()
+            .find(|(r, _)| r.contains(ratatui::layout::Position { x, y }))
+            .map(|(_, a)| *a)
+    }
+
+    /// Enregistre une zone cliquable (appelé pendant les draws).
+    pub fn reg_hit(&mut self, r: ratatui::layout::Rect, a: HitAction) {
+        self.hit.push((r, a));
     }
 
     /// Score OPSEC 0-100 affiché au dashboard — heuristique v0.1.

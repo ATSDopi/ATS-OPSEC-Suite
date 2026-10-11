@@ -4,11 +4,13 @@
 //! · KEM hybride X-Wing : `kem.rs` · keyring : `keys.rs` · diceware :
 //! `passphrase.rs`. Voir docs/SPEC.md §2.1 pour le design complet.
 
+pub mod ciphers;
 pub mod engine;
 pub mod format;
 pub mod kdf;
 pub mod kem;
 pub mod keys;
+pub mod pack;
 pub mod passphrase;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,9 @@ pub const FORMAT_VERSION: u16 = 1;
 /// Taille de chunk par défaut pour le STREAM AEAD (256 Kio).
 pub const DEFAULT_CHUNK_SIZE: u32 = 256 * 1024;
 
-/// Suite de chiffrement sélectionnable.
+/// Étiquette de suite conservée pour la **compat v1** des en-têtes
+/// (les containers écrits avant le registre `CipherKind`). La vérité
+/// est désormais le champ `ciphers` de l'en-tête.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CipherSuite {
@@ -31,26 +35,31 @@ pub enum CipherSuite {
 }
 
 impl CipherSuite {
-    pub const ALL: &'static [CipherSuite] = &[
-        CipherSuite::XChaCha20,
-        CipherSuite::Aes256Gcm,
-        CipherSuite::Cascade,
-    ];
+    /// Repli pour containers écrits sans champ `ciphers` (v1 initiale).
+    pub fn to_kinds(self) -> Vec<ciphers::CipherKind> {
+        use ciphers::CipherKind as K;
+        match self {
+            Self::XChaCha20 => vec![K::XChaCha20],
+            Self::Aes256Gcm => vec![K::Aes256Gcm],
+            Self::Cascade => K::DEFAULT_CASCADE.to_vec(),
+        }
+    }
+
+    /// Étiquette compat écrite dans les nouveaux containers.
+    pub fn from_kinds(kinds: &[ciphers::CipherKind]) -> Self {
+        use ciphers::CipherKind as K;
+        match kinds {
+            [K::XChaCha20] => Self::XChaCha20,
+            [K::Aes256Gcm] => Self::Aes256Gcm,
+            _ => Self::Cascade,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             CipherSuite::XChaCha20 => "xchacha20-poly1305",
             CipherSuite::Aes256Gcm => "aes-256-gcm",
-            CipherSuite::Cascade => "xchacha20+aes256gcm",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "xchacha20" | "xchacha" | "chacha" => Some(Self::XChaCha20),
-            "aes256gcm" | "aes-gcm" | "aes" | "aes256" => Some(Self::Aes256Gcm),
-            "cascade" | "both" | "dual" => Some(Self::Cascade),
-            _ => None,
+            CipherSuite::Cascade => "cascade",
         }
     }
 }
@@ -93,9 +102,10 @@ impl Argon2Params {
     }
 }
 
+pub use ciphers::CipherKind;
 pub use engine::{
     Credential, EncryptOptions, KeySource, decrypt_file, decrypt_stream, encrypt_file,
-    encrypt_stream, inspect, inspect_bytes,
+    encrypt_paths, encrypt_stream, inspect, inspect_bytes,
 };
 pub use format::AosHeader;
 pub use kem::{XwingPublic, XwingSecret};

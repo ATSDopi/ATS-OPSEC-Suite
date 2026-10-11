@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ciphers::CipherKind;
 use super::{Argon2Params, CipherSuite, FORMAT_VERSION, MAGIC};
 use crate::error::{OpsecError, Result};
 
@@ -42,7 +43,11 @@ pub struct KdfBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AosHeader {
     pub v: u16,
+    /// Étiquette compat v1 — `ciphers` est la source de vérité.
     pub suite: CipherSuite,
+    /// Couches AEAD ordonnées (interne → externe). Vide = repli `suite`.
+    #[serde(default)]
+    pub ciphers: Vec<String>,
     pub chunk_size: u32,
     /// Préfixe de nonce aléatoire par fichier (hex 16o).
     pub nonce_prefix_hex: String,
@@ -56,20 +61,39 @@ pub struct AosHeader {
     pub compressed: bool,
     #[serde(default)]
     pub padded: bool,
+    /// Le contenu déchiffré est une archive tar (multi-fichiers/dossier).
+    #[serde(default)]
+    pub packed: bool,
 }
 
 impl AosHeader {
-    pub fn new(suite: CipherSuite, chunk_size: u32, nonce_prefix: [u8; 16]) -> Self {
+    pub fn new(ciphers: &[CipherKind], chunk_size: u32, nonce_prefix: [u8; 16]) -> Self {
         Self {
             v: FORMAT_VERSION,
-            suite,
+            suite: CipherSuite::from_kinds(ciphers),
+            ciphers: ciphers.iter().map(|k| k.id().to_string()).collect(),
             chunk_size,
             nonce_prefix_hex: hex::encode(nonce_prefix),
             kdf: None,
             recipients: Vec::new(),
             compressed: false,
             padded: false,
+            packed: false,
         }
+    }
+
+    /// Couches AEAD ordonnées du container (repli `suite` pour v1 initial).
+    pub fn cipher_kinds(&self) -> Result<Vec<CipherKind>> {
+        if self.ciphers.is_empty() {
+            return Ok(self.suite.to_kinds());
+        }
+        self.ciphers
+            .iter()
+            .map(|id| {
+                CipherKind::from_id(id)
+                    .ok_or_else(|| OpsecError::Header(format!("cipher inconnu: {id}")))
+            })
+            .collect()
     }
 
     pub fn set_kdf(&mut self, params: &Argon2Params, salt: &[u8]) {

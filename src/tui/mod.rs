@@ -9,9 +9,13 @@ mod theme;
 mod ui;
 
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -21,7 +25,9 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::config::{Config, Mode};
 use crate::error::Result;
-use app::{App, CryptMode, Field, Level, Modal, PendingAction, Screen, Tab};
+use app::{
+    App, CryptFocus, CryptMode, Field, HitAction, Level, Modal, OptRow, PendingAction, Screen, Tab,
+};
 
 /// Lance le TUI. Sans TTY (pipe/CI) : message et retour propre.
 pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
@@ -36,7 +42,8 @@ pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
         stdout,
         EnterAlternateScreen,
         cursor::Hide,
-        event::EnableBracketedPaste
+        event::EnableBracketedPaste,
+        event::EnableMouseCapture
     )?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
@@ -50,6 +57,7 @@ pub fn run(config: &mut Config, no_anim: bool) -> Result<()> {
     let _ = execute!(
         term.backend_mut(),
         event::DisableBracketedPaste,
+        event::DisableMouseCapture,
         LeaveAlternateScreen,
         cursor::Show
     );
@@ -102,6 +110,7 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
                 // Drag & drop : le terminal colle le chemin du fichier
                 // (bracketed paste) → on le sélectionne comme cible.
                 Event::Paste(text) => on_paste(app, &text),
+                Event::Mouse(m) => on_mouse(app, m),
                 _ => {}
             }
         }
@@ -221,8 +230,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
 }
 
-/// Drag & drop / paste d'un chemin de fichier → sélection comme cible
-/// dans le picker de l'onglet courant (CRYPT/SHRED) ou ouverture du dossier.
+/// Drag & drop / paste d'un chemin de fichier :
+/// CRYPT → ajout à la file de cibles · SHRED → cible du picker ·
+/// KEYS (un .aos) → modale de déchiffrement par clé.
 fn on_paste(app: &mut App, text: &str) {
     // Si une modale de saisie est ouverte → le texte collé va dans le champ.
     if let Some(Modal::Input {
@@ -251,37 +261,156 @@ fn on_paste(app: &mut App, text: &str) {
     if cleaned.is_empty() {
         return;
     }
-    let picker = match app.tab {
-        Tab::Crypt => Some(&mut app.picker_vault),
-        Tab::Shred => Some(&mut app.picker_shred),
-        _ => None,
-    };
-    let Some(p) = picker else {
-        app.toast("drop files onto CRYPT or SHRED tabs");
-        return;
-    };
-    if p.jump(&cleaned) {
-        let name = p
-            .target
-            .as_ref()
-            .map(|t| t.name.clone())
-            .unwrap_or_else(|| cleaned.clone());
-        app.push_log(Level::Ok, format!("dropped → {name}"));
-        app.toast(format!("target: {name}"));
-    } else {
-        app.toast("dropped path not found");
-        app.push_log(Level::Warn, format!("drop ignored: {cleaned}"));
+    let p = PathBuf::from(&cleaned);
+    match app.tab {
+        Tab::Crypt => {
+            if app.add_target(p.clone()) {
+                let n = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                app.push_log(Level::Ok, format!("dropped → {n}"));
+                app.toast(format!("target queued: {n} ({} total)", app.targets.len()));
+            } else {
+                app.toast(if p.exists() {
+                    "already queued"
+                } else {
+                    "dropped path not found"
+                });
+            }
+        }
+        Tab::Shred => {
+            if app.picker_shred.jump(&cleaned) {
+                let name = app
+                    .picker_shred
+                    .target
+                    .as_ref()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| cleaned.clone());
+                app.push_log(Level::Ok, format!("dropped → {name}"));
+                app.toast(format!("target: {name}"));
+            } else {
+                app.toast("dropped path not found");
+                app.push_log(Level::Warn, format!("drop ignored: {cleaned}"));
+            }
+        }
+        Tab::Keys => {
+            if p.extension().and_then(|e| e.to_str()) == Some("aos") {
+                let default_key = app
+                    .keyring
+                    .get(app.keys_sel)
+                    .map(|(n, _, _)| n.clone())
+                    .unwrap_or_default();
+                app.modal = Some(Modal::Input {
+                    title: format!("DECRYPT WITH KEY — {}", cleaned),
+                    fields: vec![Field::plain("key name").hint(format!(
+                        "selected: {default_key} · empty = try whole keyring"
+                    ))],
+                    sel: 0,
+                    strength_meter: false,
+                    action: PendingAction::DecryptKey(p),
+                });
+            } else {
+                app.toast("drop an .aos container here to decrypt it");
+            }
+        }
+        _ => app.toast("drop files onto CRYPT, SHRED or KEYS tabs"),
     }
 }
 
-/// Touches communes des file pickers — navigation (j)saut, (h)ome,
-/// backspace parent. Retourne vrai si la touche est consommée.
-fn picker_nav(app: &mut App, k: &KeyEvent, shred: bool) -> bool {
-    let picker = if shred {
-        &mut app.picker_shred
-    } else {
-        &mut app.picker_vault
-    };
+/// Clic souris / scroll — hit-testing sur les zones enregistrées au draw.
+fn on_mouse(app: &mut App, m: MouseEvent) {
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(hit) = app.hit_at(m.column, m.row) else {
+                return;
+            };
+            match hit {
+                HitAction::Tab(i) => app.tab = Tab::from_idx(i),
+                HitAction::OptRow(row) => {
+                    let rows = app.opt_rows();
+                    if let Some(pos) = rows.iter().position(|r| *r == row) {
+                        app.opts_sel = pos;
+                    }
+                    app.crypt_focus = CryptFocus::Options;
+                    app.toggle_opt_row(row);
+                }
+                HitAction::Target(i) => {
+                    app.targets_sel = i;
+                    app.crypt_focus = CryptFocus::Targets;
+                }
+                HitAction::TargetRemove(i) => {
+                    if i < app.targets.len() {
+                        let rm = app.targets.remove(i);
+                        app.targets_sel = app.targets_sel.min(app.targets.len().saturating_sub(1));
+                        app.push_log(Level::Info, format!("removed {}", rm.display()));
+                    }
+                }
+                HitAction::OpEncrypt => open_encrypt_modal(app),
+                HitAction::OpDecrypt => {
+                    if let Some(p) = app.targets.first().cloned() {
+                        open_decrypt_modal(app, &p);
+                    } else {
+                        app.toast("queue a target first");
+                    }
+                }
+                HitAction::OpAudit => {
+                    if let Some(p) = app.targets.first().cloned() {
+                        open_audit_modal(app, &p);
+                    } else {
+                        app.toast("queue a target first");
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(HitAction::Target(i)) = app.hit_at(m.column, m.row)
+                && i < app.targets.len()
+            {
+                let rm = app.targets.remove(i);
+                app.targets_sel = app.targets_sel.min(app.targets.len().saturating_sub(1));
+                app.push_log(Level::Info, format!("removed {}", rm.display()));
+            }
+        }
+        MouseEventKind::ScrollUp => match app.tab {
+            Tab::Crypt => {
+                if app.crypt_focus == CryptFocus::Targets {
+                    app.targets_sel = app.targets_sel.saturating_sub(1);
+                } else {
+                    app.opts_sel = app.opts_sel.saturating_sub(1);
+                }
+            }
+            Tab::Logs => app.log_scroll = app.log_scroll.saturating_add(1),
+            Tab::Shred => app.picker_shred.move_sel(-1),
+            Tab::Keys => app.keys_sel = app.keys_sel.saturating_sub(1),
+            _ => {}
+        },
+        MouseEventKind::ScrollDown => match app.tab {
+            Tab::Crypt => {
+                if app.crypt_focus == CryptFocus::Targets {
+                    if !app.targets.is_empty() {
+                        app.targets_sel = (app.targets_sel + 1).min(app.targets.len() - 1);
+                    }
+                } else {
+                    let n = app.opt_rows().len();
+                    app.opts_sel = (app.opts_sel + 1).min(n.saturating_sub(1));
+                }
+            }
+            Tab::Logs => app.log_scroll = app.log_scroll.saturating_sub(1),
+            Tab::Shred => app.picker_shred.move_sel(1),
+            Tab::Keys if !app.keyring.is_empty() => {
+                app.keys_sel = (app.keys_sel + 1).min(app.keyring.len() - 1)
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Touches du picker SHRED — navigation (j)saut, (h)ome, backspace parent.
+/// Retourne vrai si la touche est consommée.
+fn picker_nav(app: &mut App, k: &KeyEvent) -> bool {
+    let picker = &mut app.picker_shred;
     match k.code {
         KeyCode::Up => picker.move_sel(-1),
         KeyCode::Down => picker.move_sel(1),
@@ -302,12 +431,113 @@ fn picker_nav(app: &mut App, k: &KeyEvent, shred: bool) -> bool {
                 ],
                 sel: 0,
                 strength_meter: false,
-                action: PendingAction::JumpPath(shred),
+                action: PendingAction::JumpPath(true),
             });
         }
         _ => return false,
     }
     true
+}
+
+// ------------------------------------------------- helpers crypt modals
+
+/// Modale de chiffrement — selon le mode auth choisi dans OPTIONS.
+fn open_encrypt_modal(app: &mut App) {
+    if app.targets.is_empty() {
+        app.toast("drop files here or press [j] to queue targets");
+        return;
+    }
+    if app.crypt_ciphers.is_empty() {
+        app.toast("no cipher selected — check at least one");
+        return;
+    }
+    let first = &app.targets[0];
+    let label = if app.targets.len() == 1 {
+        first
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        format!("{} items", app.targets.len())
+    };
+    match app.crypt_mode {
+        CryptMode::Password => {
+            app.modal = Some(Modal::Input {
+                title: format!("ENCRYPT — {label}"),
+                fields: vec![
+                    Field::masked("passphrase").hint("[tab] next · empty = abort"),
+                    Field::masked("confirm"),
+                ],
+                sel: 0,
+                strength_meter: true,
+                action: PendingAction::Encrypt(app.targets.clone()),
+            });
+        }
+        CryptMode::Recipients => {
+            let names: String = app
+                .keyring
+                .iter()
+                .map(|(n, _, _)| n.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            app.modal = Some(Modal::Input {
+                title: format!("ENCRYPT TO RECIPIENTS — {label}"),
+                fields: vec![
+                    Field::plain("recipients")
+                        .hint(format!("keyring: {names} · comma-separated names")),
+                ],
+                sel: 0,
+                strength_meter: false,
+                action: PendingAction::EncryptTo(app.targets.clone()),
+            });
+        }
+    }
+}
+
+/// Modale de déchiffrement pour un `.aos` (password ou recipient key).
+fn open_decrypt_modal(app: &mut App, path: &std::path::Path) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match crate::crypto::inspect(path) {
+        Ok(h) if h.is_password_mode() => {
+            app.modal = Some(Modal::Input {
+                title: format!("DECRYPT — {name}"),
+                fields: vec![Field::masked("passphrase")],
+                sel: 0,
+                strength_meter: false,
+                action: PendingAction::Decrypt(path.to_path_buf()),
+            });
+        }
+        Ok(h) => {
+            let fps: Vec<String> = h.recipients.iter().map(|r| r.fingerprint.clone()).collect();
+            app.modal = Some(Modal::Input {
+                title: format!("DECRYPT — {name}"),
+                fields: vec![Field::plain("key name").hint(format!(
+                    "slots: {} · empty = try whole keyring",
+                    fps.join(", ")
+                ))],
+                sel: 0,
+                strength_meter: false,
+                action: PendingAction::DecryptKey(path.to_path_buf()),
+            });
+        }
+        Err(_) => app.toast("not an .aos container"),
+    }
+}
+
+/// Modale audit : dump du header d'un container.
+fn open_audit_modal(app: &mut App, path: &std::path::Path) {
+    match crate::crypto::inspect(path) {
+        Ok(h) => app.modal = Some(header_modal(&h)),
+        Err(e) => {
+            app.modal = Some(Modal::Info {
+                title: "NOT A CONTAINER".into(),
+                lines: vec![e.to_string()],
+            })
+        }
+    }
 }
 
 fn on_tab_key(app: &mut App, k: KeyEvent) {
@@ -332,134 +562,105 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
             KeyCode::Char('w') => save_config(app),
             _ => {}
         },
-        Tab::Crypt => {
-            if picker_nav(app, &k, false) {
-                return;
-            }
-            match k.code {
-                KeyCode::Char('m') => {
-                    app.crypt_mode = match app.crypt_mode {
-                        CryptMode::Password => CryptMode::Recipients,
-                        CryptMode::Recipients => CryptMode::Password,
-                    };
-                    app.toast(match app.crypt_mode {
-                        CryptMode::Password => "auth: passphrase".to_string(),
-                        CryptMode::Recipients => {
-                            "auth: recipient public keys (post-quantum)".to_string()
-                        }
+        Tab::Crypt => match app.crypt_focus {
+            CryptFocus::Targets => match k.code {
+                KeyCode::Up => app.targets_sel = app.targets_sel.saturating_sub(1),
+                KeyCode::Down if !app.targets.is_empty() => {
+                    app.targets_sel = (app.targets_sel + 1).min(app.targets.len() - 1)
+                }
+                KeyCode::Char('o') => app.crypt_focus = CryptFocus::Options,
+                KeyCode::Char('j') => {
+                    app.modal = Some(Modal::Input {
+                        title: "ADD TARGET PATH".into(),
+                        fields: vec![
+                            Field::plain("path").hint("absolute or relative path · file or folder"),
+                        ],
+                        sel: 0,
+                        strength_meter: false,
+                        action: PendingAction::JumpPath(false),
                     });
                 }
+                KeyCode::Char('x') | KeyCode::Delete if !app.targets.is_empty() => {
+                    let i = app.targets_sel.min(app.targets.len() - 1);
+                    let rm = app.targets.remove(i);
+                    app.targets_sel = app.targets_sel.min(app.targets.len().saturating_sub(1));
+                    app.push_log(Level::Info, format!("removed {}", rm.display()));
+                }
                 KeyCode::Char('c') => {
-                    use crate::crypto::CipherSuite as S;
-                    app.vault_suite = match app.vault_suite {
-                        S::XChaCha20 => S::Aes256Gcm,
-                        S::Aes256Gcm => S::Cascade,
-                        S::Cascade => S::XChaCha20,
-                    };
-                    app.toast(format!("cipher: {}", app.vault_suite.label()));
+                    app.targets.clear();
+                    app.targets_sel = 0;
+                    app.push_log(Level::Info, "targets cleared");
                 }
-                KeyCode::Char('z') => app.vault_compress = !app.vault_compress,
-                KeyCode::Char('g') => app.vault_pad = !app.vault_pad,
-                KeyCode::Char('o') => {
-                    app.vault_shred_orig = !app.vault_shred_orig;
-                    if app.vault_shred_orig {
-                        app.toast("original will be shredded after encrypt");
-                    }
-                }
-                KeyCode::Char('e') => {
-                    let Some(t) = app.picker_vault.target.clone() else {
-                        app.toast("select a target file first");
-                        return;
-                    };
-                    if t.path.extension().and_then(|e| e.to_str()) == Some("aos") {
-                        app.toast("already an .aos container");
-                        return;
-                    }
-                    match app.crypt_mode {
-                        CryptMode::Password => {
-                            app.modal = Some(Modal::Input {
-                                title: format!("ENCRYPT — {}", t.name),
-                                fields: vec![
-                                    Field::masked("passphrase").hint("[tab] next · empty = abort"),
-                                    Field::masked("confirm"),
-                                ],
-                                sel: 0,
-                                strength_meter: true,
-                                action: PendingAction::Encrypt(t.path.clone()),
-                            });
-                        }
-                        CryptMode::Recipients => {
-                            let names: String = app
-                                .keyring
-                                .iter()
-                                .map(|(n, _, _)| n.clone())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            app.modal = Some(Modal::Input {
-                                title: format!("ENCRYPT TO RECIPIENTS — {}", t.name),
-                                fields: vec![
-                                    Field::plain("recipients")
-                                        .hint(format!("keyring: {names} · comma-separated names")),
-                                ],
-                                sel: 0,
-                                strength_meter: false,
-                                action: PendingAction::EncryptTo(t.path.clone()),
-                            });
-                        }
-                    }
-                }
+                KeyCode::Char('m') => crypt_toggle_mode(app),
+                KeyCode::Char('e') => open_encrypt_modal(app),
                 KeyCode::Char('d') => {
-                    if let Some(t) = app.picker_vault.target.clone() {
-                        match crate::crypto::inspect(&t.path) {
-                            Ok(h) if h.is_password_mode() => {
-                                app.modal = Some(Modal::Input {
-                                    title: format!("DECRYPT — {}", t.name),
-                                    fields: vec![Field::masked("passphrase")],
-                                    sel: 0,
-                                    strength_meter: false,
-                                    action: PendingAction::Decrypt(t.path.clone()),
-                                });
-                            }
-                            Ok(h) => {
-                                let fps: Vec<String> =
-                                    h.recipients.iter().map(|r| r.fingerprint.clone()).collect();
-                                app.modal = Some(Modal::Input {
-                                    title: format!("DECRYPT — {}", t.name),
-                                    fields: vec![Field::plain("key name").hint(format!(
-                                        "slots: {} · empty = try whole keyring",
-                                        fps.join(", ")
-                                    ))],
-                                    sel: 0,
-                                    strength_meter: false,
-                                    action: PendingAction::DecryptKey(t.path.clone()),
-                                });
-                            }
-                            Err(_) => app.toast("not an .aos container"),
-                        }
+                    if let Some(p) = app.targets.get(app.targets_sel).cloned() {
+                        open_decrypt_modal(app, &p);
                     } else {
-                        app.toast("select a target file first");
+                        app.toast("queue a target first");
                     }
                 }
                 KeyCode::Char('i') => {
-                    if let Some(t) = app.picker_vault.target.clone() {
-                        match crate::crypto::inspect(&t.path) {
-                            Ok(h) => app.modal = Some(header_modal(&h)),
-                            Err(e) => {
-                                app.modal = Some(Modal::Info {
-                                    title: "NOT A CONTAINER".into(),
-                                    lines: vec![e.to_string()],
-                                })
-                            }
-                        }
+                    if let Some(p) = app.targets.get(app.targets_sel).cloned() {
+                        open_audit_modal(app, &p);
                     } else {
-                        app.toast("select a target file first");
+                        app.toast("queue a target first");
                     }
                 }
                 _ => {}
-            }
-        }
+            },
+            CryptFocus::Options => match k.code {
+                KeyCode::Up => app.opts_sel = app.opts_sel.saturating_sub(1),
+                KeyCode::Down => {
+                    let n = app.opt_rows().len();
+                    app.opts_sel = (app.opts_sel + 1).min(n.saturating_sub(1))
+                }
+                KeyCode::Char('o') | KeyCode::Esc => app.crypt_focus = CryptFocus::Targets,
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    let row = app.opt_rows().get(app.opts_sel).copied();
+                    if let Some(r) = row {
+                        app.toggle_opt_row(r);
+                    }
+                }
+                KeyCode::Left => {
+                    if let Some(OptRow::Cipher(i)) = app.opt_rows().get(app.opts_sel).copied()
+                        && let Some(kind) = crate::crypto::CipherKind::ALL.get(i)
+                    {
+                        app.move_cipher(*kind, -1);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(OptRow::Cipher(i)) = app.opt_rows().get(app.opts_sel).copied()
+                        && let Some(kind) = crate::crypto::CipherKind::ALL.get(i)
+                    {
+                        app.move_cipher(*kind, 1);
+                    }
+                }
+                KeyCode::Char(c @ '1'..='8') => {
+                    let i = (c as usize) - ('1' as usize);
+                    app.toggle_opt_row(OptRow::Cipher(i));
+                }
+                KeyCode::Char('m') => crypt_toggle_mode(app),
+                KeyCode::Char('e') => open_encrypt_modal(app),
+                KeyCode::Char('d') => {
+                    if let Some(p) = app.targets.get(app.targets_sel).cloned() {
+                        open_decrypt_modal(app, &p);
+                    } else {
+                        app.toast("queue a target first");
+                    }
+                }
+                KeyCode::Char('i') => {
+                    if let Some(p) = app.targets.get(app.targets_sel).cloned() {
+                        open_audit_modal(app, &p);
+                    } else {
+                        app.toast("queue a target first");
+                    }
+                }
+                _ => {}
+            },
+        },
         Tab::Shred => {
-            if picker_nav(app, &k, true) {
+            if picker_nav(app, &k) {
                 return;
             }
             match k.code {
@@ -543,6 +744,18 @@ fn on_tab_key(app: &mut App, k: KeyEvent) {
         },
         _ => {}
     }
+}
+
+/// Bascule le mode d'authentification (raccourci `m`).
+fn crypt_toggle_mode(app: &mut App) {
+    app.crypt_mode = match app.crypt_mode {
+        CryptMode::Password => CryptMode::Recipients,
+        CryptMode::Recipients => CryptMode::Password,
+    };
+    app.toast(match app.crypt_mode {
+        CryptMode::Password => "auth: passphrase".to_string(),
+        CryptMode::Recipients => "auth: recipient public keys (post-quantum)".to_string(),
+    });
 }
 
 fn save_config(app: &mut App) {
@@ -698,7 +911,7 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
                 .map(|r| format!("shredded {} B ×{} passes", r.bytes, r.passes))
             });
         }
-        PendingAction::Encrypt(path) => {
+        PendingAction::Encrypt(paths) => {
             let (p1, p2) = (val(0), val(1));
             if p1.is_empty() {
                 app.toast("empty passphrase — aborted");
@@ -713,36 +926,37 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
             if score < 2 {
                 app.push_log(Level::Warn, "weak passphrase used (zxcvbn <2/4)");
             }
-            let out = path.with_file_name(format!(
-                "{}.aos",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
+            let out = default_aos_out(&paths);
             let opts = EncryptOptions {
-                suite: app.vault_suite,
+                ciphers: app.crypt_ciphers.clone(),
                 argon2: app.argon2,
-                compress: app.vault_compress,
-                pad: app.vault_pad,
+                compress: app.crypt_compress,
+                pad: app.crypt_pad,
                 ..Default::default()
             };
-            let shred_orig = app.vault_shred_orig;
-            let src = path.clone();
-            spawn_worker(app, format!("ENCRYPT {}", path.display()), move |tx| {
+            let shred_orig = app.crypt_shred_orig;
+            let srcs = paths.clone();
+            spawn_worker(app, format!("ENCRYPT {} items", paths.len()), move |tx| {
                 let key = KeySource::Password {
                     pass: zeroize::Zeroizing::new(p1.into_bytes()),
                     keyfile: None,
                 };
-                engine::encrypt_file(&src, &out, &key, &opts, &mut |d| {
+                engine::encrypt_paths(&srcs, &out, &key, &opts, &mut |d| {
                     let _ = tx.send(app::WorkerMsg::Progress(d));
                 })?;
                 let mut msg = format!("encrypted → {}", out.display());
                 if shred_orig {
-                    crate::wipe::shred(&src, 3, &mut |_| {})?;
-                    msg.push_str(" · original shredded");
+                    for s in &srcs {
+                        if s.is_file() {
+                            crate::wipe::shred(s, 3, &mut |_| {})?;
+                        }
+                    }
+                    msg.push_str(" · originals shredded");
                 }
                 Ok(msg)
             });
         }
-        PendingAction::EncryptTo(path) => {
+        PendingAction::EncryptTo(paths) => {
             let raw = val(0);
             let names: Vec<String> = raw
                 .split(',')
@@ -764,27 +978,34 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
                     }
                 }
             }
-            let out = path.with_file_name(format!(
-                "{}.aos",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
+            let out = default_aos_out(&paths);
             let opts = EncryptOptions {
-                suite: app.vault_suite,
+                ciphers: app.crypt_ciphers.clone(),
                 argon2: app.argon2,
-                compress: app.vault_compress,
-                pad: app.vault_pad,
+                compress: app.crypt_compress,
+                pad: app.crypt_pad,
                 ..Default::default()
             };
-            let shred_orig = app.vault_shred_orig;
-            let src = path.clone();
-            spawn_worker(app, format!("ENCRYPT →{}", path.display()), move |tx| {
-                engine::encrypt_file(&src, &out, &KeySource::Recipients(pubs), &opts, &mut |d| {
-                    let _ = tx.send(app::WorkerMsg::Progress(d));
-                })?;
+            let shred_orig = app.crypt_shred_orig;
+            let srcs = paths.clone();
+            spawn_worker(app, format!("ENCRYPT →{}", paths.len()), move |tx| {
+                engine::encrypt_paths(
+                    &srcs,
+                    &out,
+                    &KeySource::Recipients(pubs),
+                    &opts,
+                    &mut |d| {
+                        let _ = tx.send(app::WorkerMsg::Progress(d));
+                    },
+                )?;
                 let mut msg = format!("encrypted → {}", out.display());
                 if shred_orig {
-                    crate::wipe::shred(&src, 3, &mut |_| {})?;
-                    msg.push_str(" · original shredded");
+                    for s in &srcs {
+                        if s.is_file() {
+                            crate::wipe::shred(s, 3, &mut |_| {})?;
+                        }
+                    }
+                    msg.push_str(" · originals shredded");
                 }
                 Ok(msg)
             });
@@ -866,25 +1087,36 @@ fn do_action(app: &mut App, action: PendingAction, fields: &[app::Field]) {
         }
         PendingAction::JumpPath(shred) => {
             let p = val(0);
-            let picker = if shred {
-                &mut app.picker_shred
+            if shred {
+                let ok = app.picker_shred.jump(&p);
+                if ok {
+                    app.toast(format!("→ {}", app.picker_shred.dir.display()));
+                } else {
+                    app.toast("path not found");
+                }
             } else {
-                &mut app.picker_vault
-            };
-            let dir = picker.dir.display().to_string();
-            let ok = picker.jump(&p);
-            let dir = if ok {
-                picker.dir.display().to_string()
-            } else {
-                dir
-            };
-            if ok {
-                app.toast(format!("→ {dir}"));
-            } else {
-                app.toast("path not found");
+                let pb = PathBuf::from(app::clean_dropped_path(&p));
+                if app.add_target(pb.clone()) {
+                    app.toast(format!("target queued: {}", pb.display()));
+                } else if pb.exists() {
+                    app.toast("already queued");
+                } else {
+                    app.toast("path not found");
+                }
             }
         }
     }
+}
+
+/// `.aos` de sortie : `<premier-stem>.aos` à côté de la première cible.
+fn default_aos_out(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
+    let first = &paths[0];
+    let name = first
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    first.with_file_name(format!("{name}.aos"))
 }
 
 fn decrypt_out(path: &std::path::Path) -> std::path::PathBuf {
@@ -896,9 +1128,14 @@ fn decrypt_out(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn header_modal(h: &crate::crypto::AosHeader) -> Modal {
+    let ciphers = h
+        .cipher_kinds()
+        .map(|ks| ks.iter().map(|k| k.id()).collect::<Vec<_>>().join(" → "))
+        .unwrap_or_else(|_| h.suite.label().into());
     let mut lines = vec![
         format!("format        : .aos v{}", h.v),
-        format!("suite         : {}", h.suite.label()),
+        format!("ciphers       : {ciphers}"),
+        format!("packed (tar)  : {}", h.packed),
         format!("chunk size    : {} KiB", h.chunk_size / 1024),
         format!(
             "nonce prefix  : {}…",

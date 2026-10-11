@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use super::{ConfigAction, KeysAction};
 use crate::config::Config;
 use crate::crypto::engine::{self, Credential, EncryptOptions, KeySource};
-use crate::crypto::{Argon2Params, CipherSuite, keys as keystore, passphrase};
+use crate::crypto::{Argon2Params, keys as keystore, passphrase};
 use crate::error::{OpsecError, Result};
 use crate::sys;
 use crate::wipe;
@@ -111,9 +111,9 @@ pub fn config(cfg: &Config, action: ConfigAction) -> Result<()> {
 }
 
 pub struct EncryptArgs {
-    pub file: String,
+    pub files: Vec<String>,
     pub out: Option<String>,
-    pub suite: CipherSuite,
+    pub ciphers: Vec<crate::crypto::CipherKind>,
     pub recipients: Vec<String>,
     pub keyfile: Option<String>,
     pub compress: bool,
@@ -124,17 +124,19 @@ pub struct EncryptArgs {
 }
 
 pub fn encrypt(a: EncryptArgs) -> Result<()> {
-    let input = Path::new(&a.file);
-    if !input.is_file() {
-        return Err(OpsecError::InvalidParam(format!(
-            "fichier introuvable: {}",
-            a.file
-        )));
+    let inputs: Vec<PathBuf> = a.files.iter().map(PathBuf::from).collect();
+    for i in &inputs {
+        if !i.exists() {
+            return Err(OpsecError::InvalidParam(format!(
+                "entrée introuvable: {}",
+                i.display()
+            )));
+        }
     }
     let out = a
         .out
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_out(&a.file, true));
+        .unwrap_or_else(|| default_out(&a.files[0], true));
     let kf = load_keyfile(a.keyfile.as_deref())?;
 
     let key_source = if a.recipients.is_empty() {
@@ -159,27 +161,43 @@ pub fn encrypt(a: EncryptArgs) -> Result<()> {
     };
 
     let opts = EncryptOptions {
-        suite: a.suite,
+        ciphers: a.ciphers.clone(),
         argon2: a.config_argon,
         compress: a.compress,
         pad: a.pad,
+        packed: false,
         chunk_size: a.chunk_kib.unwrap_or(256) * 1024,
     };
+    let suite_label = a
+        .ciphers
+        .iter()
+        .map(|k| k.id())
+        .collect::<Vec<_>>()
+        .join("→");
 
-    eprintln!("[*] encrypting → {} ({})", out.display(), a.suite.label());
+    eprintln!("[*] encrypting → {} ({suite_label})", out.display());
     let t0 = Instant::now();
-    engine::encrypt_file(input, &out, &key_source, &opts, &mut spinner_progress())?;
+    engine::encrypt_paths(&inputs, &out, &key_source, &opts, &mut spinner_progress())?;
     eprintln!(
         "\n[ok] {} → {} in {:.1?}",
-        a.file,
+        a.files.join(" + "),
         out.display(),
         t0.elapsed()
     );
 
     if a.secure_delete {
-        eprintln!("[*] shredding original…");
-        wipe::shred(input, 3, &mut |_| {})?;
-        eprintln!("[ok] original shredded (caveat: SSD/journal may retain blocks)");
+        for i in &inputs {
+            if i.is_file() {
+                eprintln!("[*] shredding {}…", i.display());
+                wipe::shred(i, 3, &mut |_| {})?;
+            } else if i.is_dir() {
+                eprintln!(
+                    "[!] {} est un dossier — shred n'efface que les fichiers seuls",
+                    i.display()
+                );
+            }
+        }
+        eprintln!("[ok] originals shredded (caveat: SSD/journal may retain blocks)");
     }
     Ok(())
 }
@@ -334,11 +352,11 @@ pub fn bench() -> Result<()> {
     );
 
     println!("── aead throughput (64 MiB) ───────────────────────────");
-    for suite in CipherSuite::ALL {
+    for kind in crate::crypto::CipherKind::ALL {
         let mut out = Vec::new();
         let src = vec![0xABu8; 64 * 1024 * 1024];
         let opts = EncryptOptions {
-            suite: *suite,
+            ciphers: vec![*kind],
             argon2: Argon2Params {
                 m_kib: 8 * 1024,
                 t: 1,
@@ -355,7 +373,7 @@ pub fn bench() -> Result<()> {
         let d = t0.elapsed().as_secs_f64();
         println!(
             "  {:<22} {:>6.0} MiB/s ({} chunks)",
-            suite.label(),
+            kind.id(),
             64.0 / d,
             (64 * 1024 * 1024) / opts.chunk_size as usize
         );

@@ -46,6 +46,20 @@ pub fn expand(master: &[u8; KEY_LEN], salt: &[u8], info: &str) -> Zeroizing<[u8;
     out
 }
 
+/// Même chose, longueur arbitraire (Deoxys-48o, Ascon-16o…).
+pub fn expand_dyn(
+    master: &[u8; KEY_LEN],
+    salt: &[u8],
+    info: &str,
+    len: usize,
+) -> Zeroizing<Vec<u8>> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), master);
+    let mut out = Zeroizing::new(vec![0u8; len]);
+    hk.expand(info.as_bytes(), out.as_mut())
+        .expect("hkdf expand dyn");
+    out
+}
+
 /// Sel aléatoire via CSPRNG OS.
 pub fn random_salt() -> Result<[u8; SALT_LEN]> {
     let mut s = [0u8; SALT_LEN];

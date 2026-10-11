@@ -48,10 +48,11 @@ ats-opsec            # launch the TUI (boot animation + dashboard)
 ats-opsec --no-anim  # skip the boot sequence
 ats-opsec probe      # host capability report (real syscalls)
 
-# encryption
+# encryption — single file, folder, or many inputs (tar-packed)
 ats-opsec encrypt secrets.zip                    # → secrets.zip.aos (argon2id)
-ats-opsec encrypt big.iso --cipher cascade       # xchacha20 + aes-256-gcm
-ats-opsec encrypt notes.txt --compress --pad     # zstd + size padding
+ats-opsec encrypt a.txt b.txt dir/               # → a.txt.aos (packed)
+ats-opsec encrypt big.iso --ciphers xchacha20,aes256gcm   # ordered cascade
+ats-opsec encrypt notes.txt --ciphers ascon --compress --pad
 ats-opsec decrypt secrets.zip.aos                # → secrets.zip
 ats-opsec info secrets.zip.aos                   # audit container header
 
@@ -70,14 +71,17 @@ ats-opsec bench                                  # argon2 calib + aead speed
 - **Boot sequence** — matrix rain, decoding ASCII logo, module init
   checklist fed by a *real* system probe (CSPRNG, CPUID features,
   hypervisor bit, memory locking, filesystem type, tracer detection).
-- **6 keyboard-driven modules** — `←→`/`tab`/`1-6` to navigate:
-  DASH (host profile, OPSEC score, prefs, local time) ·
-  CRYPT (encrypt/decrypt/audit — passphrase *or* recipients mode) ·
-  STEGO · SHRED (real multi-pass overwrite) · KEYS (X-Wing keyring) ·
-  LOGS.
-- **Drag & drop** — drop a file onto the terminal on CRYPT or SHRED
-  and it becomes the target. `j` jumps to any path, `h` goes home,
-  `backspace` climbs up, drive letters appear at the filesystem root.
+- **6 keyboard-and-mouse modules** — `←→`/`tab`/`1-6` or click to
+  navigate: DASH (host profile, OPSEC score, prefs, local time) ·
+  CRYPT · STEGO · SHRED (real multi-pass overwrite) · KEYS · LOGS.
+- **CRYPT tab** — `TARGETS` queue (drop multiple files/folders → one
+  packed `.aos`), `OPERATIONS` buttons (encrypt / decrypt / audit) and
+  a clickable `OPTIONS` panel: auth mode (passphrase ↔ recipient keys),
+  8 AEAD layers checked in cascade order (`←→` reorders), compress /
+  pad-size / shred-orig flags.
+- **Drag & drop everywhere** — drop files onto CRYPT or SHRED to queue
+  them; drop a `.aos` container onto KEYS to decrypt it with a keyring
+  secret key. `j` types a path directly.
 - **Input modals** — masked passphrase entry with live zxcvbn strength
   meter; long ops run in background workers with progress.
 - **`p` panic screen** — instant decoy (innocent PowerShell session).
@@ -118,11 +122,16 @@ chunk := u32 LE (bit31 = LAST) | ciphertext (plaintext + 16B AEAD tag)
 
 - **KDF**: Argon2id (64 MiB / t3 / p4 default; up to 2 GiB in expert mode)
   + HKDF-SHA256 subkeys — header salt + params stored, authenticated.
-- **AEAD**: XChaCha20-Poly1305 (default), AES-256-GCM (AES-NI) or
-  **cascade** (XChaCha inside AES-GCM). Per-chunk counter nonces +
-  random 16B nonce prefix; header bound via AAD (tamper-proof metadata).
+- **AEAD**: 8 ciphers usable alone or in an **ordered cascade** —
+  XChaCha20-Poly1305, AES-256-GCM, AES-128-GCM, AES-256-GCM-SIV,
+  AES-256-EAX, Deoxys-II-256-128, Ascon-128, AEGIS-256 — each layer gets
+  its own HKDF key + derived per-chunk nonce (independent failure
+  domains). Header bound via AAD (tamper-proof metadata).
 - **STREAM**: chunked (256 KiB default) — wrong password fails on the
   first chunk, truncation is detected, multi-GB files don't touch RAM.
+- **Packed mode**: multiple files/directories are tar-streamed through
+  a **pipe** (no temporary file, no full-buffer RAM) into one `.aos`
+  marked `packed:true`; extraction re-blocks path traversal.
 - **Recipients**: X-Wing hybrid KEM (X25519 + ML-KEM-768 per
   draft-irtf-cfrg-xwing) — secure even if one half breaks; multi-recipient
   slots wrap a random 32B file key.
@@ -134,7 +143,8 @@ chunk := u32 LE (bit31 = LAST) | ciphertext (plaintext + 16B AEAD tag)
 ## CLI
 
 ```
-ats-opsec encrypt <file> [--cipher xchacha20|aes256gcm|cascade]
+ats-opsec encrypt <files...> [--ciphers a,b,...] # layers: xchacha20 aes256gcm
+                              #   aes128gcm gcm-siv eax deoxys ascon aegis
                          [--to @name | --to-pub hex] [--keyfile f]
                          [--compress] [--pad] [--shred] [-m/-t/-p argon2]
 ats-opsec decrypt <file.aos> [--key name] [--keyfile f] [-o out]
@@ -148,10 +158,12 @@ ats-opsec probe [--json] · config show|path
 
 ## Stack
 
-Rust 2024 · `ratatui`+`crossterm` (TUI) · `clap` · `serde`/`toml` ·
-`windows-sys`/`libc` (OS probes) · `qrcode` · `blake3` · `argon2` ·
-`hkdf`/`sha2`/`sha3` · `chacha20poly1305` + `aes-gcm` · `ml-kem` (FIPS 203)
-+ `x25519-dalek` · `zstd` · `zeroize` + `subtle` · `zxcvbn` · `getrandom`.
+Rust 2024 · `ratatui`+`crossterm` (TUI + mouse) · `clap` · `serde`/`toml` ·
+`windows-sys`/`libc` (OS probes) · `blake3` · `argon2` ·
+`hkdf`/`sha2`/`sha3` · `chacha20poly1305` + `aes-gcm` + `aes-gcm-siv` +
+`eax` + `deoxys` + `ascon-aead` + `aegis` (8 AEAD, cascade) ·
+`ml-kem` (FIPS 203) + `x25519-dalek` · `tar` (streaming pack) ·
+`zstd` · `zeroize` + `subtle` · `zxcvbn` · `chrono`.
 
 Roadmap crates (SPEC §4): `ml-dsa`, `serpent`, `raptorq`, `image`, `hound`,
 `sssa`, `entropy`.

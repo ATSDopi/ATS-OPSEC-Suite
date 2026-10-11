@@ -1,10 +1,13 @@
 # ATS-OPSEC-Suite — Cahier des charges (v2, enrichi)
 
-> **État v0.2 (implémenté)** : TUI complet + moteur `.aos` v1 (Argon2id →
-> HKDF → STREAM XChaCha20/AES-256-GCM/cascade, en-tête authentifié par AAD),
-> KEM hybride X-Wing (X25519+ML-KEM-768) multi-destinataires, keyring,
-> keyfiles, diceware+zxcvbn, shred multi-passes, CLI complet — **non
-> audité**. Voir §7 pour le détail du shipped.
+> **État v0.2+ (implémenté)** : TUI complet + moteur `.aos` v1 (Argon2id →
+> HKDF → STREAM chunked, **8 AEAD en cascade ordonnée libre** : XChaCha20-
+> Poly1305, AES-256-GCM, AES-128-GCM, AES-GCM-SIV, AES-256-EAX,
+> Deoxys-II-256, Ascon-128, AEGIS-256 — en-tête authentifié par AAD),
+> pack multi-fichiers/dossiers (tar streamé), KEM hybride X-Wing
+> (X25519+ML-KEM-768) multi-destinataires, keyring, keyfiles,
+> diceware+zxcvbn, shred multi-passes, TUI full-souris + drag & drop,
+> CLI complet — **non audité**. Voir §7 pour le détail du shipped.
 
 > Document de conception complet. Fusion de la spec initiale
 > (`spécifications_de_la_suite_opsec_ultime.md`) et d'un brainstorming
@@ -52,9 +55,12 @@ piliers dans une interface unique :
 
 **Spec initiale conservée et précisée :**
 
-- Chiffrement en cascade paramétrable : `AES-256-GCM` →
-  `XChaCha20-Poly1305` → `Serpent-CTR-HMAC`… ordre configurable. `[v0.2]`
-  (MVP : XChaCha20-Poly1305 + AES-256-GCM + cascade de deux) `[v0.1]`
+- Chiffrement en **cascade paramétrable** : N couches AEAD dans l'ordre
+  choisi par l'utilisateur (`xchacha20, aes-256-gcm, aes-128-gcm,
+  aes-256-gcm-siv, aes-256-eax, deoxys-ii-256, ascon-128, aegis-256`),
+  clé indépendante HKDF par couche, nonce dérivé par couche+chunk.
+  `[v0.2]` — champ `ciphers` sérialisé dans l'en-tête (rétrocompat
+  v1 via le champ `suite`).
 - **STREAM chunked** (modèle age) : chunks de 64 Kio à 1 Mio, AEAD par
   chunk, nonce = préfixe aléatoire ∥ compteur, flag `LAST` sur le chunk
   final. Jamais de fichier entier en RAM, résistance à la troncature.
@@ -251,8 +257,8 @@ déjà découpés pour ça. **Zéro logique métier dans tui/cli.**
 |---|---|---|
 | TUI | `ratatui` 0.29 + `crossterm` | standard absolu |
 | Effets TUI | `tachyonfx` | v0.2 |
-| AEAD | `chacha20poly1305`, `aes-gcm` | RustCrypto audité |
-| Cascade | `serpent`, `twofish` | v0.2 |
+| AEAD | `chacha20poly1305`, `aes-gcm`, `aes-gcm-siv`, `eax`, `deoxys`, `ascon-aead`, `aegis`(pure-rust) | couches de cascade |
+| Packaging | `tar` (stream) + `std::io::pipe` | multi-fichiers → `.aos` packed |
 | KDF | `argon2`, `hkdf`, `sha2` | |
 | PQ | `ml-kem` 0.3, `ml-dsa` 0.1, `slh-dsa` | RustCrypto pur Rust, non audités → hybride obligatoire |
 | Clés | `x25519-dalek`, `ed25519-dalek` | |
@@ -302,6 +308,16 @@ déjà découpés pour ça. **Zéro logique métier dans tui/cli.**
   diceware + zxcvbn, shred N passes + rename + unlink, CLI complet,
   TUI : modales de saisie masquée + workers de progression + onglets
   VAULT/KEYS/SHRED câblés sur le moteur.
+- **v0.2+ ✅ shipped** — moteur généralisé : 8 AEAD exposés
+  (XChaCha20-Poly1305, AES-256-GCM, AES-128-GCM, AES-GCM-SIV, AES-256-EAX,
+  Deoxys-II-256, Ascon-128, AEGIS-256) en **cascade ordonnée libre** avec
+  clé par couche et nonces dérivés ; pack multi-fichiers/dossiers en tar
+  streamé (`packed:true` dans l'en-tête, extraction anti-path-traversal) ;
+  TUI CRYPT repensé (TARGETS drag&drop multi, OPERATIONS encrypt/decrypt/
+  audit, OPTIONS cliquables : auth passphrase↔recipients, couches AEAD
+  réordonnables, compress/pad/shred-orig) ; KEYS accepte un `.aos`
+  droppé → décryptage par clé ; CLI `encrypt` multi-input + `--cipher`
+  liste.
 - **v0.3** — stégo PNG/WAV dispersé + capacité + auto-analyse, QR fountain
   TX/RX (raptorq + webcam), sealed keyring (mot de passe maître),
   Shamir k-of-n + backup papier, volumes cachés + duress, ML-DSA

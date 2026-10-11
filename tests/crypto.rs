@@ -3,7 +3,7 @@
 
 use std::io::Cursor;
 
-use ats_opsec_suite::crypto::CipherSuite;
+use ats_opsec_suite::crypto::CipherKind;
 use ats_opsec_suite::crypto::engine::{self, Credential, EncryptOptions, KeySource};
 use ats_opsec_suite::error::OpsecError;
 use ats_opsec_suite::{crypto, wipe};
@@ -44,36 +44,48 @@ fn roundtrip(plain: &[u8], key: &KeySource, cred: &Credential, o: &EncryptOption
 }
 
 #[test]
-fn roundtrip_xchacha() {
-    let plain = "le fichier osint ultra secret - données sensibles".as_bytes();
-    let o = EncryptOptions {
-        suite: CipherSuite::XChaCha20,
-        ..opts()
-    };
-    let out = roundtrip(plain, &pw_key("hunter42"), &pw_cred("hunter42"), &o);
-    assert_eq!(out, plain);
+fn roundtrip_every_cipher() {
+    let plain = "le fichier osint ultra secret - données sensibles"
+        .as_bytes()
+        .repeat(4000); // ~2 chunks
+    for kind in CipherKind::ALL {
+        let o = EncryptOptions {
+            ciphers: vec![*kind],
+            ..opts()
+        };
+        let out = roundtrip(&plain, &pw_key("hunter42"), &pw_cred("hunter42"), &o);
+        assert_eq!(out, plain, "cipher {}", kind.id());
+        let h = engine::inspect_bytes(&{
+            let mut ct = Vec::new();
+            engine::encrypt_stream(Cursor::new(&plain), &mut ct, &pw_key("k"), &o, &mut |_| {})
+                .unwrap();
+            ct
+        })
+        .unwrap();
+        assert_eq!(h.cipher_kinds().unwrap(), vec![*kind]);
+    }
 }
 
 #[test]
-fn roundtrip_aes_gcm() {
-    let plain = vec![0xABu8; 300_000]; // >1 chunk à 256K
+fn roundtrip_triple_cascade_custom_order() {
+    let plain = b"cascade parano payload".repeat(5000);
+    let ciphers = vec![
+        CipherKind::Ascon128,
+        CipherKind::Aes256Gcm,
+        CipherKind::XChaCha20,
+    ];
     let o = EncryptOptions {
-        suite: CipherSuite::Aes256Gcm,
+        ciphers: ciphers.clone(),
         ..opts()
     };
     let out = roundtrip(&plain, &pw_key("p"), &pw_cred("p"), &o);
     assert_eq!(out, plain);
-}
-
-#[test]
-fn roundtrip_cascade() {
-    let plain = b"cascade mode test payload".repeat(5000);
-    let o = EncryptOptions {
-        suite: CipherSuite::Cascade,
-        ..opts()
-    };
-    let out = roundtrip(&plain, &pw_key("p"), &pw_cred("p"), &o);
-    assert_eq!(out, plain);
+    let mut ct = Vec::new();
+    engine::encrypt_stream(Cursor::new(&plain), &mut ct, &pw_key("p"), &o, &mut |_| {}).unwrap();
+    let h = engine::inspect_bytes(&ct).unwrap();
+    assert_eq!(h.cipher_kinds().unwrap(), ciphers);
+    // la suite compat v1 reste "cascade"
+    assert_eq!(h.suite, crypto::CipherSuite::Cascade);
 }
 
 #[test]
@@ -333,4 +345,35 @@ fn shred_removes_file() {
     let res = wipe::shred(&f, 2, &mut |_| {}).unwrap();
     assert_eq!(res.bytes, 10_000);
     assert!(!f.exists());
+}
+
+#[test]
+fn packed_multi_file_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    // arbre : a.txt, sub/b.txt, dossier/c.txt
+    std::fs::write(d.join("a.txt"), b"alpha").unwrap();
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub").join("b.txt"), b"beta").unwrap();
+    std::fs::create_dir_all(d.join("dossier")).unwrap();
+    std::fs::write(d.join("dossier").join("c.txt"), b"gamma").unwrap();
+
+    let inputs = vec![d.join("a.txt"), d.join("sub"), d.join("dossier")];
+    let out = d.join("bundle.aos");
+    engine::encrypt_paths(&inputs, &out, &pw_key("k"), &opts(), &mut |_| {}).unwrap();
+    let h = engine::inspect(&out).unwrap();
+    assert!(h.packed);
+
+    // Déchiffre → dossier de sortie avec l'arbre complet.
+    let dest = d.join("extracted");
+    engine::decrypt_file(&out, &dest, &pw_cred("k"), &mut |_| {}).unwrap();
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(
+        std::fs::read(dest.join("sub").join("b.txt")).unwrap(),
+        b"beta"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("dossier").join("c.txt")).unwrap(),
+        b"gamma"
+    );
 }

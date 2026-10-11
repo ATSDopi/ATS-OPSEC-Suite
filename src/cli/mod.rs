@@ -3,7 +3,7 @@
 mod cmds;
 
 use crate::config::Config;
-use crate::crypto::CipherSuite;
+use crate::crypto;
 use crate::error::Result;
 use clap::{Parser, Subcommand};
 
@@ -41,16 +41,20 @@ pub enum Command {
         action: ConfigAction,
     },
 
-    /// Encrypt a file into an .aos container.
+    /// Encrypt file(s) or directories into an .aos container.
+    /// Multiple inputs are packed into a single streamed tar archive.
     Encrypt {
-        /// Input file.
-        file: String,
-        /// Output path (default: <file>.aos).
+        /// Input files / directories (one or more).
+        #[arg(required = true)]
+        files: Vec<String>,
+        /// Output path (default: <first>.aos).
         #[arg(short, long)]
         out: Option<String>,
-        /// Cipher suite: xchacha20 | aes256gcm | cascade.
-        #[arg(long, default_value = "xchacha20", value_parser = parse_suite)]
-        cipher: CipherSuite,
+        /// AEAD layer(s), comma-separated — >1 = cascade in that order.
+        /// xchacha20 | aes256gcm | aes128gcm | gcm-siv | eax | deoxys |
+        /// ascon | aegis
+        #[arg(long, default_value = "xchacha20", value_parser = parse_ciphers)]
+        ciphers: Vec<crypto::CipherKind>,
         /// Recipient(s): keyring name (@alice) or .pub file path.
         /// When set, no password is needed (X-Wing hybrid KEM).
         #[arg(long = "to")]
@@ -158,9 +162,39 @@ pub enum KeysAction {
     Delete { name: String },
 }
 
-fn parse_suite(s: &str) -> std::result::Result<CipherSuite, String> {
-    CipherSuite::parse(s)
-        .ok_or_else(|| format!("unknown suite '{s}' — xchacha20 | aes256gcm | cascade"))
+/// Parse un nom de cipher (alias friendly → `CipherKind`).
+fn parse_cipher(s: &str) -> Option<crypto::CipherKind> {
+    use crypto::CipherKind as K;
+    match s.to_ascii_lowercase().as_str() {
+        "xchacha20" | "xchacha" | "chacha" => Some(K::XChaCha20),
+        "aes256gcm" | "aes-gcm" | "aes" | "aes256" => Some(K::Aes256Gcm),
+        "aes128gcm" | "aes128" => Some(K::Aes128Gcm),
+        "gcm-siv" | "gcmsiv" | "siv" => Some(K::Aes256GcmSiv),
+        "eax" | "aes-eax" => Some(K::Aes256Eax),
+        "deoxys" | "deoxys-ii" => Some(K::DeoxysII256),
+        "ascon" | "ascon128" => Some(K::Ascon128),
+        "aegis" | "aegis256" => Some(K::Aegis256),
+        _ => None,
+    }
+}
+
+/// `--cipher` accepte une liste séparée par virgules → cascade ordonnée.
+fn parse_ciphers(s: &str) -> std::result::Result<Vec<crypto::CipherKind>, String> {
+    s.split(',')
+        .map(str::trim)
+        .map(|part| {
+            parse_cipher(part).ok_or_else(|| {
+                format!(
+                    "unknown cipher '{part}' — {}",
+                    crypto::CipherKind::ALL
+                        .iter()
+                        .map(|k| k.id())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )
+            })
+        })
+        .collect()
 }
 
 pub fn dispatch(cli: Cli, config: &mut Config) -> Result<()> {
@@ -169,9 +203,9 @@ pub fn dispatch(cli: Cli, config: &mut Config) -> Result<()> {
         Some(Command::Probe) => cmds::probe(cli.json),
         Some(Command::Config { action }) => cmds::config(config, action),
         Some(Command::Encrypt {
-            file,
+            files,
             out,
-            cipher,
+            ciphers,
             recipients,
             keyfile,
             compress,
@@ -182,9 +216,9 @@ pub fn dispatch(cli: Cli, config: &mut Config) -> Result<()> {
             argon_lanes,
             chunk_kib,
         }) => cmds::encrypt(cmds::EncryptArgs {
-            file,
+            files,
             out,
-            suite: cipher,
+            ciphers,
             recipients,
             keyfile,
             compress,

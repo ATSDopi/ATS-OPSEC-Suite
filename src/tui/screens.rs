@@ -9,7 +9,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table, Widget,
 };
 
-use super::app::{App, CryptMode, FilePicker, Tab};
+use super::app::{App, CryptFocus, CryptMode, FilePicker, HitAction, OptRow, Tab};
 use super::theme::Theme;
 use crate::config::Mode;
 
@@ -258,137 +258,284 @@ fn dashboard(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .render(vrows[1], f.buffer_mut());
 }
 
-// ---------------------------------------------------------------- vault
+// ---------------------------------------------------------------- crypt
 
 fn crypt(f: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
 
-    draw_picker(f, cols[0], &app.picker_vault, app.tab == Tab::Crypt, theme);
+    // -- LEFT : file de cibles (drop zone) -----------------------------------
+    let focused_t = app.crypt_focus == CryptFocus::Targets;
+    let mut tblock = panel("TARGETS — drop files/folders", theme);
+    if focused_t {
+        tblock = tblock.border_style(Style::default().fg(theme.accent));
+    }
+    let tinner = tblock.inner(cols[0]);
+    tblock.render(cols[0], f.buffer_mut());
 
+    let visible = tinner.height.saturating_sub(1) as usize;
+    let items: Vec<Line> = if app.targets.is_empty() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  drag & drop files or folders here",
+                Style::default().fg(theme.accent),
+            )),
+            Line::from(Span::styled(
+                "  or press [j] to type a path",
+                Style::default().fg(theme.dim),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  · multiple inputs → single .aos (tar-packed)",
+                Style::default().fg(theme.dim),
+            )),
+            Line::from(Span::styled(
+                "  · a dropped folder encrypts recursively",
+                Style::default().fg(theme.dim),
+            )),
+        ]
+    } else {
+        app.targets
+            .iter()
+            .enumerate()
+            .take(visible)
+            .map(|(i, p)| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string());
+                let (icon, info) = if p.is_dir() {
+                    ("▸", "(dir)".to_string())
+                } else {
+                    (
+                        " ",
+                        human_size(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)),
+                    )
+                };
+                let sel = focused_t && i == app.targets_sel;
+                let c = if sel { theme.accent } else { theme.fg };
+                Line::from(vec![
+                    Span::styled(if sel { "▶" } else { icon }, Style::default().fg(c)),
+                    Span::styled(format!(" {name:<30}"), Style::default().fg(c)),
+                    Span::styled(format!("{info:>10}"), Style::default().fg(theme.dim)),
+                    Span::styled(" [x]", Style::default().fg(theme.err)),
+                ])
+            })
+            .collect()
+    };
+    let total: u64 = app
+        .targets
+        .iter()
+        .filter(|p| p.is_file())
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let mut lines = items;
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if app.targets.is_empty() {
+            "  queue is empty".to_string()
+        } else {
+            format!(
+                "  {} item(s) · {} queued",
+                app.targets.len(),
+                human_size(total)
+            )
+        },
+        Style::default().fg(theme.dim),
+    )));
+
+    // Zones cliquables des lignes de cibles.
+    let n_targets = app.targets.len().min(visible);
+    for i in 0..n_targets {
+        let row = Rect {
+            x: tinner.x,
+            y: tinner.y + i as u16,
+            width: tinner.width,
+            height: 1,
+        };
+        app.reg_hit(row, HitAction::Target(i));
+        let xr = Rect {
+            x: tinner.x + tinner.width.saturating_sub(4),
+            y: row.y,
+            width: 4,
+            height: 1,
+        };
+        app.reg_hit(xr, HitAction::TargetRemove(i));
+    }
+    Paragraph::new(lines).render(tinner, f.buffer_mut());
+
+    // -- RIGHT : operations + options ----------------------------------------
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(9)])
+        .constraints([Constraint::Length(4), Constraint::Min(10)])
         .split(cols[1]);
 
-    // Target info.
-    let mut lines = Vec::new();
-    let target = app
-        .picker_vault
-        .target
-        .as_ref()
-        .map(|t| (t.name.clone(), t.size, t.path.clone()));
-    match target {
-        Some((name, size, path)) => {
-            lines.push(Line::from(vec![
-                Span::styled("target   ", Style::default().fg(theme.dim)),
-                Span::styled(name, Style::default().fg(theme.accent)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("size     ", Style::default().fg(theme.dim)),
-                Span::styled(human_size(size), Style::default().fg(theme.fg)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("path     ", Style::default().fg(theme.dim)),
-                Span::styled(path.display().to_string(), Style::default().fg(theme.fg)),
-            ]));
-            let hash = app.picker_vault.target_hash();
-            lines.push(Line::from(vec![
-                Span::styled("blake3   ", Style::default().fg(theme.dim)),
-                Span::styled(
-                    hash.map(|h| h.chars().take(32).collect::<String>())
-                        .map(|h| format!("{h}…"))
-                        .unwrap_or_else(|| "n/a".into()),
-                    Style::default().fg(theme.accent2),
-                ),
-            ]));
+    // OPERATIONS — boutons cliquables.
+    let ops = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(right[0]);
+    let op_defs = [
+        ("[e] encrypt", HitAction::OpEncrypt),
+        ("[d] decrypt", HitAction::OpDecrypt),
+        ("[i] audit", HitAction::OpAudit),
+    ];
+    for (cell, (label, action)) in ops.iter().zip(op_defs.iter()) {
+        let b = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.dim));
+        Paragraph::new(Line::from(Span::styled(
+            *label,
+            Style::default().fg(theme.accent),
+        )))
+        .block(b)
+        .alignment(ratatui::layout::Alignment::Center)
+        .render(*cell, f.buffer_mut());
+        app.reg_hit(*cell, *action);
+    }
+
+    // OPTIONS — lignes cliquables : auth, cipher layers, flags.
+    let focused_o = app.crypt_focus == CryptFocus::Options;
+    let mut oblock = panel("OPTIONS — space/click to toggle", theme);
+    if focused_o {
+        oblock = oblock.border_style(Style::default().fg(theme.accent));
+    }
+    let oinner = oblock.inner(right[1]);
+    oblock.render(right[1], f.buffer_mut());
+
+    let opt_rows = app.opt_rows();
+    let sel_row = opt_rows.get(app.opts_sel).copied();
+    let mut olines: Vec<(Option<OptRow>, Line)> = Vec::new();
+
+    olines.push((
+        None,
+        Line::from(Span::styled(
+            "AUTH — how the container key is wrapped",
+            Style::default()
+                .fg(theme.accent2)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ));
+    for row in [OptRow::AuthPassword, OptRow::AuthRecipients] {
+        let (on_, name, note) = match row {
+            OptRow::AuthPassword => (
+                app.crypt_mode == CryptMode::Password,
+                "passphrase",
+                "argon2id wrap · you choose it at encrypt time",
+            ),
+            OptRow::AuthRecipients => (
+                app.crypt_mode == CryptMode::Recipients,
+                "recipient keys",
+                "x25519+ml-kem-768 · post-quantum · no password",
+            ),
+            _ => unreachable!(),
+        };
+        let mark = if on_ { "(●)" } else { "( )" };
+        let c = if on_ { theme.ok } else { theme.fg };
+        olines.push((
+            Some(row),
+            Line::from(vec![
+                Span::styled(format!(" {mark} "), Style::default().fg(c)),
+                Span::styled(format!("{name:<16}"), Style::default().fg(c)),
+                Span::styled(note, Style::default().fg(theme.dim)),
+            ]),
+        ));
+    }
+
+    olines.push((None, Line::from("")));
+    olines.push((
+        None,
+        Line::from(Span::styled(
+            "CIPHER LAYERS — check order = cascade [1]inner→[n]outer",
+            Style::default()
+                .fg(theme.accent2)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ));
+    for (i, kind) in crate::crypto::CipherKind::ALL.iter().enumerate() {
+        let row = OptRow::Cipher(i);
+        let pos = app.crypt_ciphers.iter().position(|k| k == kind);
+        let (mark, c) = match pos {
+            Some(n) => (format!("[{}]", n + 1), theme.ok),
+            None => ("[ ]".to_string(), theme.fg),
+        };
+        let digit = i + 1;
+        olines.push((
+            Some(row),
+            Line::from(vec![
+                Span::styled(format!("{digit} "), Style::default().fg(theme.dim)),
+                Span::styled(format!("{mark} "), Style::default().fg(c)),
+                Span::styled(format!("{:<22}", kind.id()), Style::default().fg(c)),
+                Span::styled(kind.note(), Style::default().fg(theme.dim)),
+            ]),
+        ));
+    }
+
+    olines.push((None, Line::from("")));
+    olines.push((
+        None,
+        Line::from(Span::styled(
+            "FLAGS",
+            Style::default()
+                .fg(theme.accent2)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ));
+    let flag_defs = [
+        (
+            OptRow::Compress,
+            app.crypt_compress,
+            "compress",
+            "zstd before seal",
+        ),
+        (OptRow::Pad, app.crypt_pad, "pad-size", "hide true length"),
+        (
+            OptRow::ShredOrig,
+            app.crypt_shred_orig,
+            "shred-orig",
+            "wipe sources after encrypt",
+        ),
+    ];
+    for (row, on_, name, note) in flag_defs {
+        let mark = if on_ { "[x]" } else { "[ ]" };
+        let c = if on_ { theme.ok } else { theme.fg };
+        olines.push((
+            Some(row),
+            Line::from(vec![
+                Span::styled(format!("  {mark} "), Style::default().fg(c)),
+                Span::styled(format!("{name:<12}"), Style::default().fg(c)),
+                Span::styled(note, Style::default().fg(theme.dim)),
+            ]),
+        ));
+    }
+
+    // Highlight de la ligne courante (focus options) + zones clics.
+    let mut drawn: Vec<Line> = Vec::with_capacity(olines.len());
+    for (i, (row, line)) in olines.into_iter().enumerate() {
+        let mut line = line;
+        if focused_o && row.is_some() && row == sel_row {
+            line = line.style(Style::default().bg(Color::Rgb(28, 48, 44)));
         }
-        None => {
-            lines.push(Line::from(Span::styled(
-                "no target — select a file with [enter]",
-                Style::default().fg(theme.dim),
-            )));
+        drawn.push(line);
+        if let Some(r) = row {
+            let hit = Rect {
+                x: oinner.x,
+                y: oinner.y + i as u16,
+                width: oinner.width,
+                height: 1,
+            };
+            app.reg_hit(hit, HitAction::OptRow(r));
         }
     }
-    Paragraph::new(lines)
-        .block(panel("TARGET", theme))
-        .render(right[0], f.buffer_mut());
-
-    // Actions + options live, catégorisées par niveau.
-    let on = |b: bool| {
-        if b {
-            ("on ", theme.ok)
-        } else {
-            ("off", theme.dim)
-        }
-    };
-    let (zc, zo) = (on(app.vault_compress), on(app.vault_shred_orig));
-    let gc = on(app.vault_pad);
-    let (mode_s, mode_c) = match app.crypt_mode {
-        CryptMode::Password => ("passphrase (argon2id)", theme.fg),
-        CryptMode::Recipients => ("recipient keys — POST-QUANTUM", theme.accent2),
-    };
-    let tier = match app.vault_suite {
-        crate::crypto::CipherSuite::Cascade => ("MAX", theme.accent2),
-        crate::crypto::CipherSuite::XChaCha20 => ("STRONG", theme.ok),
-        crate::crypto::CipherSuite::Aes256Gcm => ("STRONG·AES-NI", theme.ok),
-    };
-    let actions = vec![
-        Line::from(vec![
-            Span::styled("[e] ", Style::default().fg(theme.accent)),
-            Span::raw("encrypt  "),
-            Span::styled("[d] ", Style::default().fg(theme.accent)),
-            Span::raw("decrypt  "),
-            Span::styled("[i] ", Style::default().fg(theme.accent)),
-            Span::raw("audit  "),
-            Span::styled("[drop]", Style::default().fg(theme.dim)),
-            Span::raw(" = select file"),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("[m] ", Style::default().fg(theme.accent)),
-            Span::raw("auth mode   "),
-            Span::styled(mode_s, Style::default().fg(mode_c)),
-        ]),
-        Line::from(vec![
-            Span::styled("[c] ", Style::default().fg(theme.accent)),
-            Span::raw("cipher      "),
-            Span::styled(
-                format!("{:<22}", app.vault_suite.label()),
-                Style::default().fg(theme.fg),
-            ),
-            Span::styled(tier.0, Style::default().fg(tier.1)),
-        ]),
-        Line::from(vec![
-            Span::styled("[z] ", Style::default().fg(theme.accent)),
-            Span::raw("compress    "),
-            Span::styled(zc.0, Style::default().fg(zc.1)),
-            Span::raw("   [g] pad-size    "),
-            Span::styled(gc.0, Style::default().fg(gc.1)),
-        ]),
-        Line::from(vec![
-            Span::styled("[o] ", Style::default().fg(theme.accent)),
-            Span::raw("shred orig  "),
-            Span::styled(zo.0, Style::default().fg(zo.1)),
-            Span::styled(
-                "   [j] jump  [h] home  [⬅] up",
-                Style::default().fg(theme.dim),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(
-                "kdf argon2id m={}KiB t={} p={}  ([a] on DASH)",
-                app.argon2.m_kib, app.argon2.t, app.argon2.p
-            ),
-            Style::default().fg(theme.dim),
-        )),
-    ];
-    Paragraph::new(actions)
-        .block(panel("OPERATIONS", theme))
-        .render(right[1], f.buffer_mut());
+    Paragraph::new(drawn).render(oinner, f.buffer_mut());
 }
 
 fn draw_picker(f: &mut Frame, area: Rect, picker: &FilePicker, focused: bool, theme: &Theme) {
@@ -677,6 +824,7 @@ fn keys(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("[x]", "export public key (hex)"),
         ("[d]", "delete selected pair"),
         ("[r]", "refresh keyring"),
+        ("drop", ".aos file here → decrypt with key"),
     ];
     let mut items: Vec<ListItem> = ops
         .iter()
